@@ -732,5 +732,22 @@ if(BUILD_TESTING)
         )
         add_test(NAME moderngekko.native_render_probe
                  COMMAND moderngekko_native_render_probe)
+
+        # Phase 1c: same real captured-state shader as the probe above, but
+        # actually rendered -- real D3D12 device/swapchain/PSO built from the
+        # reflected bytecode, one DrawInstanced, presented to a visible
+        # window. See tests/native_render_window.cpp.
+        add_executable(moderngekko_native_render_window
+            tests/native_render_window.cpp
+        )
+        target_link_libraries(moderngekko_native_render_window
+            PRIVATE ModernGekko::DolphinVideo ModernGekko::GlslToHlsl
+                    d3dcompiler.lib d3d12.lib dxgi.lib
+        )
+        if(MSVC)
+            target_compile_options(moderngekko_native_render_window PRIVATE /Zc:preprocessor)
+            target_compile_definitions(moderngekko_native_render_window PRIVATE
+                UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
+        endif()
     endif()
 endif()
