@@ -84,6 +84,14 @@ ComPtr<ID3DBlob> CompileFromCapturedState(std::string_view* out_vs_src, std::str
   std::array<std::uint32_t, 0x1058> xf{};
   std::array<std::uint32_t, 256> bp{};
   cp[0x50u] = (1u << 13u) | (1u << 15u);
+  // XFMEM_SETNUMTEXGENS (0x103f): VertexShaderGen reads its texgen count from
+  // this XF register, while PixelShaderGen reads BP's GENMODE.numtexgens
+  // below -- two independent state entries that the real game always keeps
+  // in sync. Leaving this zeroed (as this synthetic probe state originally
+  // did) makes the VS emit 0 texcoords while the PS still expects 1, which is
+  // what actually caused "Signatures between stages are incompatible" --
+  // not a spirv_cross per-stage cross-compilation bug.
+  xf[0x103fu] = 1u;
   bp[0x00u] = 0x4001;   // GENMODE (captured from live BT3 combat)
   bp[0x28u] = 0x49040;  // TREF (captured)
   bp[0x41u] = 0x4a0;    // BLENDMODE (captured)
@@ -128,18 +136,19 @@ ComPtr<ID3DBlob> CompileFromCapturedState(std::string_view* out_vs_src, std::str
   return vs_blob;
 }
 
-// Fallback synthetic shader pair used for the actual PSO/draw call. The real
-// BT3-captured shader (compiled above via CompileFromCapturedState) proves
-// the GLSL->SPIRV->HLSL->bytecode pipeline works and is reflectable, but
-// cross-compiling the vertex and pixel stages independently (two separate
-// TranslateGlslToHlsl calls) lets spirv_cross assign TEXCOORD/SV_Position
-// varying locations independently per stage; when the two stages don't
-// consume identically-shaped varying sets, CreateGraphicsPipelineState
-// rejects the mismatched interface ("Signatures between stages are
-// incompatible"). Fixing that requires cross-compiling both stages through
-// one shared interface-variable pass (out of scope for this probe -- see
-// final report). This trivial hand-written pair proves the rest of the
-// pipeline (device/swapchain/root-sig/PSO/texture/draw/present) end-to-end.
+// Historical fallback shader pair, no longer used for the PSO/draw (see
+// xf[0x103fu] comment in CompileFromCapturedState): "Signatures between
+// stages are incompatible" turned out not to be a spirv_cross per-stage
+// cross-compilation issue at all. Real Dolphin (VideoCommon/Spirv.cpp)
+// compiles VS and PS independently too, the same way TranslateGlslToHlsl
+// does here. The actual cause was that this probe's synthetic captured
+// state only set BP's GENMODE.numtexgens (read by PixelShaderGen) while
+// leaving XF's NumTexGen.numTexGens (read by VertexShaderGen) at its
+// zero-initialized default -- an internally inconsistent state the real
+// game never produces, since it always writes both together. That mismatch
+// made the VS emit 0 texcoord varyings while the PS expected 1, which is
+// what CreateGraphicsPipelineState was correctly rejecting. Kept only as a
+// reference for what a minimal hand-written shader pair looks like.
 constexpr const char* kSyntheticVs = R"(
 struct VSInput { float3 pos : POSITION; };
 struct VSOutput { float4 pos : SV_Position; };
@@ -265,37 +274,17 @@ int RealMain()
 {
   moderngekko::DolphinShaderCompiler::SetCacheDirectory("native-render-window-cache");
 
-  // Prove the real Phase-1b pipeline still compiles the actual BT3-captured
-  // shader end-to-end (kept as a side effect/log line; its blobs are
-  // deliberately not used for the PSO below -- see kSyntheticVs/kSyntheticPs
-  // comment for why).
-  {
-    std::string vs_hlsl, ps_hlsl;
-    std::string_view vs_src, ps_src;
-    ComPtr<ID3DBlob> real_ps_blob;
-    ComPtr<ID3DBlob> real_vs_blob =
-        CompileFromCapturedState(&vs_src, &ps_src, &vs_hlsl, &ps_hlsl, &real_ps_blob);
-    (void)real_vs_blob;
-  }
-
-  ComPtr<ID3DBlob> vs_blob, ps_blob, synth_errors;
-  HRESULT synth_hr = D3DCompile(kSyntheticVs, std::strlen(kSyntheticVs), nullptr, nullptr, nullptr,
-                                "main", "vs_5_0", 0, 0, &vs_blob, &synth_errors);
-  if (FAILED(synth_hr))
-  {
-    std::fprintf(stderr, "synthetic VS compile failed: %s\n",
-                 synth_errors ? static_cast<const char*>(synth_errors->GetBufferPointer()) : "?");
-    Fail("synthetic VS D3DCompile", synth_hr);
-  }
-  synth_hr = D3DCompile(kSyntheticPs, std::strlen(kSyntheticPs), nullptr, nullptr, nullptr, "main",
-                        "ps_5_0", 0, 0, &ps_blob, &synth_errors);
-  if (FAILED(synth_hr))
-  {
-    std::fprintf(stderr, "synthetic PS compile failed: %s\n",
-                 synth_errors ? static_cast<const char*>(synth_errors->GetBufferPointer()) : "?");
-    Fail("synthetic PS D3DCompile", synth_hr);
-  }
-  std::printf("Synthetic VS bytecode=%zu bytes, PS bytecode=%zu bytes (used for PSO/draw)\n",
+  // Drive the actual PSO/draw with the real BT3-captured shader (the whole
+  // point of this probe). See the xf[0x103fu] comment in
+  // CompileFromCapturedState for the fix that made the VS/PS interface
+  // agree; kSyntheticVs/kSyntheticPs below are kept only as a documented
+  // fallback reference, no longer used.
+  std::string vs_hlsl, ps_hlsl;
+  std::string_view vs_src, ps_src;
+  ComPtr<ID3DBlob> ps_blob;
+  ComPtr<ID3DBlob> vs_blob =
+      CompileFromCapturedState(&vs_src, &ps_src, &vs_hlsl, &ps_hlsl, &ps_blob);
+  std::printf("Real captured-state VS bytecode=%zu bytes, PS bytecode=%zu bytes (used for PSO/draw)\n",
               vs_blob->GetBufferSize(), ps_blob->GetBufferSize());
 
   // --- reflect bytecode to build input layout + root signature ---
@@ -531,9 +520,7 @@ int RealMain()
   if (FAILED(hr))
     Fail("CreateRootSignature", hr);
 
-  // --- PSO (using the synthetic vs_blob/ps_blob + reflected vs_stage.input_layout
-  // from above -- see kSyntheticVs/kSyntheticPs comment for why the real
-  // BT3-captured shader isn't used directly here) ---
+  // --- PSO (real BT3-captured-state vs_blob/ps_blob + reflected input layout) ---
   D3D12_GRAPHICS_PIPELINE_STATE_DESC pso_desc{};
   pso_desc.pRootSignature = root_sig.Get();
   pso_desc.VS = {vs_blob->GetBufferPointer(), vs_blob->GetBufferSize()};
@@ -586,13 +573,29 @@ int RealMain()
   }
   std::printf("PSO created OK.\n");
 
-  // --- vertex buffer: NDC triangle, 3 floats/vertex (matches synthetic VS's
-  // single POSITION float3 input) ---
+  // --- vertex buffer: NDC triangle. The real captured-state VS has multiple
+  // input attributes (e.g. rawpos/rawcolor0/rawcolor1), not just a single
+  // POSITION float3 like the old synthetic shader, so fill generically from
+  // the reflected layout: first attribute gets the NDC triangle position
+  // (padded with 1.0f to its component count), every other attribute is
+  // filled with 1.0f per component (same convention as the cbuffer fill
+  // above).
   const float ndc[3][3] = {{0.0f, 0.5f, 0.0f}, {0.5f, -0.5f, 0.0f}, {-0.5f, -0.5f, 0.0f}};
   std::vector<float> vertex_data;
-  for (const auto& v : ndc)
-    for (float f : v)
-      vertex_data.push_back(f);
+  for (int v = 0; v < 3; ++v)
+  {
+    for (std::size_t attr = 0; attr < vs_stage.input_components.size(); ++attr)
+    {
+      const int components = vs_stage.input_components[attr];
+      for (int c = 0; c < components; ++c)
+      {
+        if (attr == 0)
+          vertex_data.push_back(c < 3 ? ndc[v][c] : 1.0f);
+        else
+          vertex_data.push_back(1.0f);
+      }
+    }
+  }
   const UINT vb_size = static_cast<UINT>(vertex_data.size() * sizeof(float));
   ComPtr<ID3D12Resource> vertex_buffer;
   {
@@ -617,7 +620,7 @@ int RealMain()
   D3D12_VERTEX_BUFFER_VIEW vbv{};
   vbv.BufferLocation = vertex_buffer->GetGPUVirtualAddress();
   vbv.SizeInBytes = vb_size;
-  vbv.StrideInBytes = 3 * sizeof(float);
+  vbv.StrideInBytes = vertex_stride;
 
   // --- constant buffers (1.0f fill + identity for any reflected mat4) ---
   auto make_cbv_buffer = [&](UINT size) {
