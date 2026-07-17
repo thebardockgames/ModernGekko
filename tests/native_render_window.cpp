@@ -208,17 +208,30 @@ struct RealGeometry
   std::vector<std::uint32_t> indices;
 };
 
+// Phase 3b: the dump format now holds several "=== draw N ===" blocks (see
+// gx_vertex_dump.cpp), each with its own locally-0-based index list. Merge
+// them into one combined vertex/index buffer, offsetting each draw's
+// indices by the running vertex count so far, so a single
+// DrawIndexedInstanced renders every captured draw's geometry together
+// (their relative positions preserved, since the caller normalizes the
+// WHOLE merged set to NDC via one shared bounding box, not per-draw).
 std::optional<RealGeometry> LoadRealGeometry(const char* path)
 {
   std::ifstream in(path);
   if (!in)
     return std::nullopt;
   RealGeometry geo;
+  std::uint32_t draw_base_vertex = 0;
   std::string line;
   while (std::getline(in, line))
   {
     if (line.empty() || line[0] == '#' || line.rfind("topology", 0) == 0)
       continue;
+    if (line.rfind("=== draw", 0) == 0)
+    {
+      draw_base_vertex = static_cast<std::uint32_t>(geo.positions.size());
+      continue;
+    }
     std::istringstream iss(line);
     std::string tag;
     iss >> tag;
@@ -238,12 +251,44 @@ std::optional<RealGeometry> LoadRealGeometry(const char* path)
     {
       std::uint32_t idx = 0;
       iss >> idx;
-      geo.indices.push_back(idx);
+      geo.indices.push_back(draw_base_vertex + idx);
     }
   }
   if (geo.positions.empty() || geo.indices.empty())
     return std::nullopt;
   return geo;
+}
+
+// Phase 3a: real decoded BT3 texture (see gx_vertex_dump.cpp's
+// MaybeDumpTexture), a simple "u32 width, u32 height, then width*height
+// RGBA8 pixels" binary blob. Returns nullopt if absent (e.g. the captured
+// texture was a paletted format we don't resolve a TLUT for yet -- see
+// Phase 3 report) so the caller can fall back to a synthetic texture.
+struct RealTexture
+{
+  std::uint32_t width = 0;
+  std::uint32_t height = 0;
+  std::vector<std::uint8_t> rgba8;  // width*height*4 bytes
+};
+
+std::optional<RealTexture> LoadRealTexture(const char* path)
+{
+  std::ifstream in(path, std::ios::binary);
+  if (!in)
+    return std::nullopt;
+  RealTexture tex;
+  std::uint32_t header[2] = {0, 0};
+  in.read(reinterpret_cast<char*>(header), sizeof(header));
+  if (!in || header[0] == 0 || header[1] == 0 || header[0] > 4096 || header[1] > 4096)
+    return std::nullopt;
+  tex.width = header[0];
+  tex.height = header[1];
+  tex.rgba8.resize(static_cast<std::size_t>(tex.width) * tex.height * 4);
+  in.read(reinterpret_cast<char*>(tex.rgba8.data()),
+         static_cast<std::streamsize>(tex.rgba8.size()));
+  if (!in)
+    return std::nullopt;
+  return tex;
 }
 
 struct ReflectedResource
@@ -710,6 +755,9 @@ int RealMain()
     draw_indices = real_geo->indices;
     std::printf("using REAL decoded geometry: %zu vertices, %zu indices (from %s)\n",
                 ndc_positions.size(), draw_indices.size(), dump_path ? dump_path : "gx_vertex_dump.txt");
+    std::printf("bbox: x=[%.2f,%.2f] y=[%.2f,%.2f] first_ndc=(%.3f,%.3f) last_ndc=(%.3f,%.3f)\n",
+                min_x, max_x, min_y, max_y, ndc_positions.front()[0], ndc_positions.front()[1],
+                ndc_positions.back()[0], ndc_positions.back()[1]);
   }
   else
   {
@@ -827,7 +875,23 @@ int RealMain()
   };
   write_cbuffers(vs_stage);
 
-  // --- textures: 4x4 checkerboard for every reflected texture slot ---
+  // --- textures: real decoded BT3 texture if available (Phase 3a), else a
+  // 4-quadrant diagnostic texture (distinct color per quadrant, so UV
+  // mapping correctness is visible in a framebuffer readback -- a flat
+  // checkerboard can't distinguish "wrong UVs" from "right UVs", a quadrant
+  // texture can) for every reflected texture slot.
+  const char* real_tex_path_env = std::getenv("MODERNGEKKO_REAL_TEXTURE_DUMP");
+  const std::string real_tex_path =
+      real_tex_path_env ? real_tex_path_env : std::string(dump_path ? dump_path : "gx_vertex_dump.txt") + ".tex";
+  const std::optional<RealTexture> real_tex = LoadRealTexture(real_tex_path.c_str());
+  const UINT tex_w = real_tex ? real_tex->width : 8u;
+  const UINT tex_h = real_tex ? real_tex->height : 8u;
+  if (real_tex)
+    std::printf("using REAL decoded texture: %ux%u (from %s)\n", tex_w, tex_h, real_tex_path.c_str());
+  else
+    std::printf("no real texture dump found/decodable at %s, using synthetic quadrant texture\n",
+               real_tex_path.c_str());
+
   std::vector<ComPtr<ID3D12Resource>> keep_alive_textures;
   auto write_textures = [&](StageReflection& stage, ID3D12GraphicsCommandList* cl) {
     for (std::size_t i = 0; i < stage.textures.size(); ++i)
@@ -835,8 +899,8 @@ int RealMain()
       D3D12_HEAP_PROPERTIES heap{D3D12_HEAP_TYPE_DEFAULT};
       D3D12_RESOURCE_DESC rdesc{};
       rdesc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
-      rdesc.Width = 4;
-      rdesc.Height = 4;
+      rdesc.Width = tex_w;
+      rdesc.Height = tex_h;
       rdesc.DepthOrArraySize = 1;
       rdesc.MipLevels = 1;
       rdesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
@@ -866,14 +930,17 @@ int RealMain()
   write_textures(ps_stage, setup_cl.Get());
   std::printf("checkpoint: cbuffers/textures written (%zu tex)\n", keep_alive_textures.size());
 
-  // Fill each checkerboard texture via a staging upload buffer + CopyTextureRegion.
+  // Fill each texture (real decoded pixels, or the quadrant fallback) via a
+  // staging upload buffer + CopyTextureRegion. D3D12 requires each row of a
+  // placed footprint to be 256-byte aligned.
+  const UINT row_pitch = (tex_w * 4u + 255u) & ~255u;
   std::vector<ComPtr<ID3D12Resource>> staging_buffers;
   for (auto& tex : keep_alive_textures)
   {
     D3D12_HEAP_PROPERTIES heap{D3D12_HEAP_TYPE_UPLOAD};
     D3D12_RESOURCE_DESC rdesc{};
     rdesc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-    rdesc.Width = 256 * 4;  // 4 rows * 256-byte-aligned row pitch
+    rdesc.Width = static_cast<UINT64>(row_pitch) * tex_h;
     rdesc.Height = 1;
     rdesc.DepthOrArraySize = 1;
     rdesc.MipLevels = 1;
@@ -883,20 +950,49 @@ int RealMain()
     device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &rdesc,
                                     D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
                                     IID_PPV_ARGS(&staging));
-    std::uint8_t checker[4 * 256] = {};
-    for (int y = 0; y < 4; ++y)
-      for (int x = 0; x < 4; ++x)
+    std::vector<std::uint8_t> pixels(static_cast<std::size_t>(row_pitch) * tex_h, 0);
+    for (UINT y = 0; y < tex_h; ++y)
+    {
+      for (UINT x = 0; x < tex_w; ++x)
       {
-        const bool white = ((x + y) % 2) == 0;
-        std::uint8_t* px = &checker[y * 256 + x * 4];
-        px[0] = white ? 255 : 40;
-        px[1] = white ? 255 : 40;
-        px[2] = white ? 255 : 220;
-        px[3] = 255;
+        std::uint8_t* px = &pixels[y * row_pitch + x * 4];
+        if (real_tex)
+        {
+          const std::uint8_t* src = &real_tex->rgba8[(y * tex_w + x) * 4];
+          px[0] = src[0];
+          px[1] = src[1];
+          px[2] = src[2];
+          px[3] = src[3];
+        }
+        else
+        {
+          // 4 distinct-color quadrants: red/green/blue/yellow, so a
+          // readback can confirm UV orientation, not just "some texture".
+          const bool right = x >= tex_w / 2;
+          const bool bottom = y >= tex_h / 2;
+          if (!right && !bottom)
+          {
+            px[0] = 220; px[1] = 40; px[2] = 40;
+          }
+          else if (right && !bottom)
+          {
+            px[0] = 40; px[1] = 220; px[2] = 40;
+          }
+          else if (!right && bottom)
+          {
+            px[0] = 40; px[1] = 40; px[2] = 220;
+          }
+          else
+          {
+            px[0] = 220; px[1] = 220; px[2] = 40;
+          }
+          px[3] = 255;
+        }
       }
+    }
     void* mapped = nullptr;
     staging->Map(0, nullptr, &mapped);
-    std::memcpy(mapped, checker, sizeof(checker));
+    std::memcpy(mapped, pixels.data(), pixels.size());
     staging->Unmap(0, nullptr);
 
     D3D12_TEXTURE_COPY_LOCATION dst{};
@@ -907,10 +1003,10 @@ int RealMain()
     src.pResource = staging.Get();
     src.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
     src.PlacedFootprint.Footprint.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
-    src.PlacedFootprint.Footprint.Width = 4;
-    src.PlacedFootprint.Footprint.Height = 4;
+    src.PlacedFootprint.Footprint.Width = tex_w;
+    src.PlacedFootprint.Footprint.Height = tex_h;
     src.PlacedFootprint.Footprint.Depth = 1;
-    src.PlacedFootprint.Footprint.RowPitch = 256;
+    src.PlacedFootprint.Footprint.RowPitch = row_pitch;
     setup_cl->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
 
     D3D12_RESOURCE_BARRIER barrier{};

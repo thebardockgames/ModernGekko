@@ -245,6 +245,7 @@ if(MODERNGEKKO_ENABLE_DOLPHIN_RUNTIME)
         src/gpu/gx_state_backend.cpp
         src/gpu/gx_vertex_loader.cpp
         src/gpu/gx_vertex_dump.cpp
+        src/gpu/gx_texture_decoder.cpp
         src/memory/address_space.cpp
         vendor/dolphin/Source/Core/DolphinNoGUI/Platform.cpp
         vendor/dolphin/Source/Core/DolphinNoGUI/PlatformHeadless.cpp
