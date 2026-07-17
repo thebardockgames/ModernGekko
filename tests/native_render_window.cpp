@@ -23,6 +23,7 @@
 #include "moderngekko/glsl_to_hlsl.hpp"
 
 #include <array>
+#include <cctype>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -30,6 +31,7 @@
 #include <fstream>
 #include <optional>
 #include <sstream>
+#include <string>
 #include <vector>
 
 #include <d3d12.h>
@@ -258,7 +260,13 @@ struct StageReflection
   std::vector<int> input_components;
   std::vector<ReflectedResource> cbuffers;
   std::vector<UINT> cbuffer_sizes;
-  std::vector<std::vector<std::pair<UINT, bool>>> cbuffer_mat4_offsets;  // (byte offset, is_matrix)
+  // (byte offset, size, is_matrix_like) -- "is_matrix_like" covers both a
+  // true D3D_SVC_MATRIX_ROWS/COLUMNS type AND spirv_cross's usual HLSL
+  // lowering of a GLSL mat4/mat4-array uniform into a plain vec4 array
+  // (D3D_SVC_VECTOR, cols=4), which reflection reports with no matrix class
+  // at all -- so name-based detection (containing "mtx", or "proj") is the
+  // only reliable signal here.
+  std::vector<std::vector<std::tuple<UINT, UINT, bool>>> cbuffer_mat4_offsets;
   std::vector<ReflectedResource> textures;
   std::vector<ReflectedResource> samplers;
 };
@@ -277,7 +285,7 @@ void ReflectResources(ID3D12ShaderReflection* refl, StageReflection* out)
       auto* cb = refl->GetConstantBufferByName(bind.Name);
       D3D12_SHADER_BUFFER_DESC cbdesc{};
       cb->GetDesc(&cbdesc);
-      std::vector<std::pair<UINT, bool>> mat_offsets;
+      std::vector<std::tuple<UINT, UINT, bool>> mat_offsets;
       for (UINT v = 0; v < cbdesc.Variables; ++v)
       {
         auto* var = cb->GetVariableByIndex(v);
@@ -286,11 +294,30 @@ void ReflectResources(ID3D12ShaderReflection* refl, StageReflection* out)
         auto* type = var->GetType();
         D3D12_SHADER_TYPE_DESC tdesc{};
         type->GetDesc(&tdesc);
-        const bool is_mat4 = (tdesc.Rows == 4 && tdesc.Columns == 4 &&
-                              tdesc.Type == D3D_SVT_FLOAT &&
-                              (tdesc.Class == D3D_SVC_MATRIX_ROWS ||
-                               tdesc.Class == D3D_SVC_MATRIX_COLUMNS));
-        mat_offsets.emplace_back(vdesc.StartOffset, is_mat4);
+        const bool is_true_mat4 = (tdesc.Rows == 4 && tdesc.Columns == 4 &&
+                                   tdesc.Type == D3D_SVT_FLOAT &&
+                                   (tdesc.Class == D3D_SVC_MATRIX_ROWS ||
+                                    tdesc.Class == D3D_SVC_MATRIX_COLUMNS));
+        // spirv_cross's HLSL backend lowers a GLSL mat4/mat4-array uniform
+        // to a plain vec4 (or vec4 array) in the cbuffer -- reflection sees
+        // D3D_SVC_VECTOR/cols=4 with no matrix class at all, so name is the
+        // only reliable signal for e.g. cproj/cpnmtx/ctexmtx/ctrmtx/cnmtx/
+        // cpostmtx/cindmtx (all real Dolphin shadergen transform matrices).
+        std::string name_lower(vdesc.Name);
+        for (char& ch : name_lower)
+          ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+        const bool looks_like_matrix_name =
+            name_lower.find("mtx") != std::string::npos || name_lower.find("proj") != std::string::npos;
+        const bool is_vec4_array_matrix =
+            tdesc.Class == D3D_SVC_VECTOR && tdesc.Columns == 4 && tdesc.Type == D3D_SVT_FLOAT &&
+            vdesc.Size % 16 == 0 && looks_like_matrix_name;
+        const bool is_matrix_like = is_true_mat4 || is_vec4_array_matrix;
+        std::printf("  cbuf var: name=%s offset=%u size=%u rows=%u cols=%u class=%d type=%d "
+                    "matrix_like=%d\n",
+                    vdesc.Name, vdesc.StartOffset, vdesc.Size, tdesc.Rows, tdesc.Columns,
+                    static_cast<int>(tdesc.Class), static_cast<int>(tdesc.Type),
+                    is_matrix_like ? 1 : 0);
+        mat_offsets.emplace_back(vdesc.StartOffset, vdesc.Size, is_matrix_like);
       }
       out->cbuffers.push_back(r);
       out->cbuffer_sizes.push_back(cbdesc.Size);
@@ -307,17 +334,28 @@ void ReflectResources(ID3D12ShaderReflection* refl, StageReflection* out)
   }
 }
 
-void FillIdentityAndOnes(std::vector<std::uint8_t>* buf, const std::vector<std::pair<UINT, bool>>& mats)
+void FillIdentityAndOnes(std::vector<std::uint8_t>* buf,
+                        const std::vector<std::tuple<UINT, UINT, bool>>& mats)
 {
   constexpr std::uint32_t kOne = 0x3F800000u;  // 1.0f
   for (std::size_t i = 0; i + 4 <= buf->size(); i += 4)
     std::memcpy(buf->data() + i, &kOne, 4);
-  for (const auto& [offset, is_mat4] : mats)
+  // Identity rows, cycled every 4 vec4 elements -- this is correct whether
+  // the variable is a single 4x4 matrix (4 elements), an affine 3-row
+  // matrix (3 elements, e.g. cpnmtx's 48-byte position/normal halves), or
+  // an array of several 4x4 matrices back to back (e.g. ctrmtx/cnmtx's
+  // per-texture-stage arrays): each 16-byte chunk's row index within its
+  // own matrix is (chunk_index % 4) regardless of how many matrices are
+  // packed in, since every real matrix here is a whole multiple of 4 rows
+  // or is meant to be read as repeating 4-row blocks by the shader.
+  static constexpr float kIdentityRows[4][4] = {
+      {1, 0, 0, 0}, {0, 1, 0, 0}, {0, 0, 1, 0}, {0, 0, 0, 1}};
+  for (const auto& [offset, size, is_matrix_like] : mats)
   {
-    if (!is_mat4 || offset + 64 > buf->size())
+    if (!is_matrix_like)
       continue;
-    float identity[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
-    std::memcpy(buf->data() + offset, identity, sizeof(identity));
+    for (UINT chunk = 0; chunk * 16 + 16 <= size && offset + chunk * 16 + 16 <= buf->size(); ++chunk)
+      std::memcpy(buf->data() + offset + chunk * 16, kIdentityRows[chunk % 4], 16);
   }
 }
 }  // namespace
@@ -338,6 +376,12 @@ int RealMain()
       CompileFromCapturedState(&vs_src, &ps_src, &vs_hlsl, &ps_hlsl, &ps_blob);
   std::printf("Real captured-state VS bytecode=%zu bytes, PS bytecode=%zu bytes (used for PSO/draw)\n",
               vs_blob->GetBufferSize(), ps_blob->GetBufferSize());
+  {
+    std::ofstream vf("real_vs_debug.hlsl");
+    vf << vs_hlsl;
+    std::ofstream pf("real_ps_debug.hlsl");
+    pf << ps_hlsl;
+  }
 
   // --- reflect bytecode to build input layout + root signature ---
   ComPtr<ID3D12ShaderReflection> vs_refl, ps_refl;
@@ -1074,6 +1118,116 @@ int RealMain()
       }
       std::printf("frame 0 presented, %llu debug-layer message(s)\n",
                   static_cast<unsigned long long>(n));
+
+      // --- Phase 2c diagnostic: read back the just-presented backbuffer so
+      // we can programmatically confirm whether real pixels were drawn,
+      // since nobody in this loop can look at the live window. Readback
+      // must happen on the SAME frame we just rendered, before it's
+      // reused/overwritten by a later Present.
+      {
+        D3D12_RESOURCE_DESC bbdesc = backbuffers[idx]->GetDesc();
+        UINT64 total_bytes = 0;
+        D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint{};
+        UINT num_rows = 0;
+        UINT64 row_bytes = 0;
+        device->GetCopyableFootprints(&bbdesc, 0, 1, 0, &footprint, &num_rows, &row_bytes,
+                                      &total_bytes);
+
+        D3D12_HEAP_PROPERTIES rb_heap{D3D12_HEAP_TYPE_READBACK};
+        D3D12_RESOURCE_DESC rb_desc{};
+        rb_desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        rb_desc.Width = total_bytes;
+        rb_desc.Height = 1;
+        rb_desc.DepthOrArraySize = 1;
+        rb_desc.MipLevels = 1;
+        rb_desc.SampleDesc.Count = 1;
+        rb_desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        ComPtr<ID3D12Resource> readback;
+        device->CreateCommittedResource(&rb_heap, D3D12_HEAP_FLAG_NONE, &rb_desc,
+                                        D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                                        IID_PPV_ARGS(&readback));
+
+        ComPtr<ID3D12CommandAllocator> rb_alloc;
+        device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&rb_alloc));
+        ComPtr<ID3D12GraphicsCommandList> rb_cl;
+        device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, rb_alloc.Get(), nullptr,
+                                  IID_PPV_ARGS(&rb_cl));
+
+        D3D12_RESOURCE_BARRIER to_copy_src{};
+        to_copy_src.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        to_copy_src.Transition.pResource = backbuffers[idx].Get();
+        to_copy_src.Transition.StateBefore = D3D12_RESOURCE_STATE_PRESENT;
+        to_copy_src.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+        rb_cl->ResourceBarrier(1, &to_copy_src);
+
+        D3D12_TEXTURE_COPY_LOCATION dst{};
+        dst.pResource = readback.Get();
+        dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+        dst.PlacedFootprint = footprint;
+        D3D12_TEXTURE_COPY_LOCATION src{};
+        src.pResource = backbuffers[idx].Get();
+        src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        src.SubresourceIndex = 0;
+        rb_cl->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+
+        D3D12_RESOURCE_BARRIER back_to_present = to_copy_src;
+        back_to_present.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
+        back_to_present.Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;
+        rb_cl->ResourceBarrier(1, &back_to_present);
+        rb_cl->Close();
+
+        ID3D12CommandList* rb_lists[] = {rb_cl.Get()};
+        queue->ExecuteCommandLists(1, rb_lists);
+        ++fence_value;
+        queue->Signal(fence.Get(), fence_value);
+        if (fence->GetCompletedValue() < fence_value)
+        {
+          fence->SetEventOnCompletion(fence_value, fence_event);
+          WaitForSingleObject(fence_event, INFINITE);
+        }
+
+        void* mapped = nullptr;
+        D3D12_RANGE read_range{0, static_cast<SIZE_T>(total_bytes)};
+        readback->Map(0, &read_range, &mapped);
+        const auto* pixels = static_cast<const std::uint8_t*>(mapped);
+
+        // Write a trivial uncompressed .ppm (P6) so the actual image can be
+        // inspected byte-for-byte without any external library.
+        std::ofstream ppm("frame0_readback.ppm", std::ios::binary);
+        ppm << "P6\n" << kWidth << " " << kHeight << "\n255\n";
+        std::uint64_t sum_r = 0, sum_g = 0, sum_b = 0;
+        std::uint8_t min_r = 255, min_g = 255, min_b = 255, max_r = 0, max_g = 0, max_b = 0;
+        std::size_t non_background = 0;
+        for (UINT y = 0; y < kHeight; ++y)
+        {
+          const std::uint8_t* row = pixels + y * footprint.Footprint.RowPitch;
+          for (UINT x = 0; x < kWidth; ++x)
+          {
+            const std::uint8_t r = row[x * 4 + 0];
+            const std::uint8_t g = row[x * 4 + 1];
+            const std::uint8_t b = row[x * 4 + 2];
+            ppm.put(static_cast<char>(r));
+            ppm.put(static_cast<char>(g));
+            ppm.put(static_cast<char>(b));
+            sum_r += r; sum_g += g; sum_b += b;
+            min_r = std::min(min_r, r); max_r = std::max(max_r, r);
+            min_g = std::min(min_g, g); max_g = std::max(max_g, g);
+            min_b = std::min(min_b, b); max_b = std::max(max_b, b);
+            // clear color is roughly (13,13,31) in 8-bit; anything clearly
+            // brighter/different is real drawn content, not background.
+            if (r > 30 || g > 30 || b > 60)
+              ++non_background;
+          }
+        }
+        readback->Unmap(0, nullptr);
+        const std::size_t total_px = static_cast<std::size_t>(kWidth) * kHeight;
+        std::printf("READBACK frame0: avg=(%.1f,%.1f,%.1f) min=(%u,%u,%u) max=(%u,%u,%u) "
+                    "non_background_px=%zu/%zu (%.2f%%)\n",
+                    static_cast<double>(sum_r) / total_px, static_cast<double>(sum_g) / total_px,
+                    static_cast<double>(sum_b) / total_px, min_r, min_g, min_b, max_r, max_g, max_b,
+                    non_background, total_px, 100.0 * non_background / total_px);
+      }
+
       logged_frame0 = true;
     }
   }
