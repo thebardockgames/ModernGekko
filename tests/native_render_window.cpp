@@ -305,13 +305,15 @@ struct StageReflection
   std::vector<int> input_components;
   std::vector<ReflectedResource> cbuffers;
   std::vector<UINT> cbuffer_sizes;
-  // (byte offset, size, is_matrix_like) -- "is_matrix_like" covers both a
+  // (byte offset, size, kind) -- kind 1 ("is_matrix_like") covers both a
   // true D3D_SVC_MATRIX_ROWS/COLUMNS type AND spirv_cross's usual HLSL
   // lowering of a GLSL mat4/mat4-array uniform into a plain vec4 array
   // (D3D_SVC_VECTOR, cols=4), which reflection reports with no matrix class
   // at all -- so name-based detection (containing "mtx", or "proj") is the
-  // only reliable signal here.
-  std::vector<std::vector<std::tuple<UINT, UINT, bool>>> cbuffer_mat4_offsets;
+  // only reliable signal here. kind 2 is the special-cased "cpixelcenter"
+  // uniform (see FillIdentityAndOnes) -- NOT a matrix, but the generic
+  // 1.0f-fill is actively wrong for it (see comment there).
+  std::vector<std::vector<std::tuple<UINT, UINT, int>>> cbuffer_mat4_offsets;
   std::vector<ReflectedResource> textures;
   std::vector<ReflectedResource> samplers;
 };
@@ -330,7 +332,7 @@ void ReflectResources(ID3D12ShaderReflection* refl, StageReflection* out)
       auto* cb = refl->GetConstantBufferByName(bind.Name);
       D3D12_SHADER_BUFFER_DESC cbdesc{};
       cb->GetDesc(&cbdesc);
-      std::vector<std::tuple<UINT, UINT, bool>> mat_offsets;
+      std::vector<std::tuple<UINT, UINT, int>> mat_offsets;
       for (UINT v = 0; v < cbdesc.Variables; ++v)
       {
         auto* var = cb->GetVariableByIndex(v);
@@ -357,12 +359,35 @@ void ReflectResources(ID3D12ShaderReflection* refl, StageReflection* out)
             tdesc.Class == D3D_SVC_VECTOR && tdesc.Columns == 4 && tdesc.Type == D3D_SVT_FLOAT &&
             vdesc.Size % 16 == 0 && looks_like_matrix_name;
         const bool is_matrix_like = is_true_mat4 || is_vec4_array_matrix;
+        // Dolphin's real VertexShaderGen output (see real_vs.hlsl) uses
+        // cpixelcenter for a genuine D3D pixel-center/half-texel correction:
+        // it both flips o.pos.xy's sign (via sign(cpixelcenter.xy * (1,-1)))
+        // and then SUBTRACTS cpixelcenter.xy * o.pos.w from clip-space
+        // position outright. The generic 1.0f fill makes that subtraction
+        // knock a full (-1,-1) offset into every vertex's clip position --
+        // exactly the "everything pinned to the bottom-left corner,
+        // regardless of how large the source geometry's bounding box is"
+        // symptom this fix addresses (a constant clip-space translation
+        // clips away anything that lands outside the visible [-1,1] box,
+        // so enlarging the input geometry never visibly changes the
+        // rendered region). cpixelcenter is real per-viewport data in
+        // Dolphin (order of 1/width, tiny), not something "identity" even
+        // conceptually applies to, so it needs its own special-cased fill:
+        // x>0, y<0 (any magnitude) makes the sign-flip step a no-op, and
+        // z=-1, w=0 makes the z-remap step (o.pos.z = w*cpixelcenter.w -
+        // z*cpixelcenter.z) reduce to z=z unchanged. See FillIdentityAndOnes.
+        // spirv_cross prefixes cbuffer variable names with an SPIR-V-ID-
+        // derived tag (e.g. "_70_cpixelcenter") that isn't stable across
+        // recompiles, so match by suffix rather than exact name.
+        const bool is_pixelcenter =
+            name_lower.size() >= 12 &&
+            name_lower.compare(name_lower.size() - 12, 12, "cpixelcenter") == 0;
+        const int kind = is_pixelcenter ? 2 : (is_matrix_like ? 1 : 0);
         std::printf("  cbuf var: name=%s offset=%u size=%u rows=%u cols=%u class=%d type=%d "
-                    "matrix_like=%d\n",
+                    "kind=%d\n",
                     vdesc.Name, vdesc.StartOffset, vdesc.Size, tdesc.Rows, tdesc.Columns,
-                    static_cast<int>(tdesc.Class), static_cast<int>(tdesc.Type),
-                    is_matrix_like ? 1 : 0);
-        mat_offsets.emplace_back(vdesc.StartOffset, vdesc.Size, is_matrix_like);
+                    static_cast<int>(tdesc.Class), static_cast<int>(tdesc.Type), kind);
+        mat_offsets.emplace_back(vdesc.StartOffset, vdesc.Size, kind);
       }
       out->cbuffers.push_back(r);
       out->cbuffer_sizes.push_back(cbdesc.Size);
@@ -380,7 +405,7 @@ void ReflectResources(ID3D12ShaderReflection* refl, StageReflection* out)
 }
 
 void FillIdentityAndOnes(std::vector<std::uint8_t>* buf,
-                        const std::vector<std::tuple<UINT, UINT, bool>>& mats)
+                        const std::vector<std::tuple<UINT, UINT, int>>& mats)
 {
   constexpr std::uint32_t kOne = 0x3F800000u;  // 1.0f
   for (std::size_t i = 0; i + 4 <= buf->size(); i += 4)
@@ -395,9 +420,22 @@ void FillIdentityAndOnes(std::vector<std::uint8_t>* buf,
   // or is meant to be read as repeating 4-row blocks by the shader.
   static constexpr float kIdentityRows[4][4] = {
       {1, 0, 0, 0}, {0, 1, 0, 0}, {0, 0, 1, 0}, {0, 0, 0, 1}};
-  for (const auto& [offset, size, is_matrix_like] : mats)
+  // See the is_pixelcenter comment in ReflectResources: x>0/y<0 (tiny
+  // magnitude, sign is all that matters for the first use) makes the
+  // sign-flip step a no-op, and z=-1/w=0 makes the z-remap step reduce to
+  // an unchanged z. This is a real Dolphin per-viewport uniform, not
+  // something "identity" conceptually applies to -- it needs an exact
+  // special-cased value, not a generic fill.
+  static constexpr float kPixelCenterNeutral[4] = {1e-5f, -1e-5f, -1.0f, 0.0f};
+  for (const auto& [offset, size, kind] : mats)
   {
-    if (!is_matrix_like)
+    if (kind == 2)
+    {
+      if (offset + 16 <= buf->size())
+        std::memcpy(buf->data() + offset, kPixelCenterNeutral, 16);
+      continue;
+    }
+    if (kind != 1)
       continue;
     for (UINT chunk = 0; chunk * 16 + 16 <= size && offset + chunk * 16 + 16 <= buf->size(); ++chunk)
       std::memcpy(buf->data() + offset + chunk * 16, kIdentityRows[chunk % 4], 16);
