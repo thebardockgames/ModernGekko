@@ -5,6 +5,7 @@
 // HLSL to the real D3D HLSL compiler to confirm it's valid D3D12-consumable
 // shader source for real game state -- not synthetic/test state.
 #include "moderngekko/dolphin_shader_compiler.hpp"
+#include "moderngekko/glsl_to_hlsl.hpp"
 
 #include <array>
 #include <cstdio>
@@ -17,6 +18,39 @@ using Microsoft::WRL::ComPtr;
 
 namespace
 {
+// Same header Dolphin's D3DCommon backend prepends before feeding shadergen
+// source to glslang (see VideoBackends/D3DCommon/Shader.cpp's SHADER_HEADER):
+// GLSL layout/binding macros standing in for HLSL register syntax, plus
+// HLSL->GLSL type aliases so shadergen's HLSL-flavored identifiers parse as
+// GLSL. Duplicated here (not included from D3DCommon/Shader.cpp) to avoid
+// pulling that file's full Common/VideoCommon dependency graph into this
+// probe -- see glsl_to_hlsl.hpp for why.
+constexpr std::string_view kShaderHeader = R"(
+  #version 450 core
+  #extension GL_ARB_shading_language_include : enable
+  #define ATTRIBUTE_LOCATION(x) layout(location = x)
+  #define FRAGMENT_OUTPUT_LOCATION(x) layout(location = x)
+  #define FRAGMENT_OUTPUT_LOCATION_INDEXED(x, y) layout(location = x, index = y)
+  #define UBO_BINDING(packing, x) layout(packing, binding = (x - 1))
+  #define SAMPLER_BINDING(x) layout(binding = x)
+  #define TEXEL_BUFFER_BINDING(x) layout(binding = x)
+  #define SSBO_BINDING(x) layout(binding = (x + 2))
+  #define VARYING_LOCATION(x) layout(location = x)
+  #define FORCE_EARLY_Z layout(early_fragment_tests) in
+  #define float2 vec2
+  #define float3 vec3
+  #define float4 vec4
+  #define uint2 uvec2
+  #define uint3 uvec3
+  #define uint4 uvec4
+  #define int2 ivec2
+  #define int3 ivec3
+  #define int4 ivec4
+  #define frac fract
+  #define lerp mix
+  #define API_D3D 1
+)";
+
 bool CompileHlsl(const std::string& source, const char* entry, const char* target)
 {
   ComPtr<ID3DBlob> code;
@@ -32,6 +66,28 @@ bool CompileHlsl(const std::string& source, const char* entry, const char* targe
   }
   std::printf("D3DCompile(%s, %s) OK, bytecode=%zu bytes\n", entry, target, code->GetBufferSize());
   return true;
+}
+
+// Real end-to-end translation, matching what Dolphin's own D3D backends do
+// (see D3DCommon::Shader::CompileShader/GetHLSL/GetSpirv): GLSL shadergen
+// source -> glslang -> SPIR-V -> spirv_cross::CompilerHLSL -> HLSL text ->
+// D3DCompile -> bytecode. Feeding raw GLSL-flavored shadergen source straight
+// to D3DCompile (the pre-Phase-1b version of this probe) fails on
+// UBO_BINDING/SAMPLER_BINDING, which are GLSL layout macros with no HLSL
+// meaning -- this is the real translation path, not a workaround.
+bool CompileViaRealPipeline(const std::string& source, moderngekko::GlslShaderKind kind,
+                           const char* entry, const char* target, const char* label)
+{
+  const std::string full_source = std::string(kShaderHeader) + source;
+  const auto hlsl = moderngekko::TranslateGlslToHlsl(full_source, kind);
+  if (!hlsl)
+  {
+    std::fprintf(stderr, "%s: GLSL->SPIRV->HLSL translation failed\n", label);
+    return false;
+  }
+  std::printf("--- %s: cross-compiled HLSL (first 300 chars) ---\n%.300s\n...\n", label,
+              hlsl->c_str());
+  return CompileHlsl(*hlsl, entry, target);
 }
 }
 
@@ -76,18 +132,14 @@ int main()
   std::printf("--- generated pixel shader (first 400 chars) ---\n%.400s\n...\n",
               shaders.pixel.c_str());
 
-  // Dolphin's shadergen output is GLSL-flavored source with layout/binding
-  // macros (UBO_BINDING, SAMPLER_BINDING, ...) resolved by each backend's own
-  // preamble; the real D3D backends (see D3DCommon::Shader::GetSpirv/GetHLSL)
-  // compile it as GLSL through glslang to SPIR-V, then cross-compile to HLSL
-  // via spirv_cross::CompilerHLSL, and only THAT text goes to D3DCompile. So
-  // feeding the raw shadergen buffer straight to D3DCompile is expected to
-  // fail on those macros -- this is not a bug, it's the documented next step
-  // (Phase 1b: link videocommon's SPIRV::CompileVertexShader/CompileFragmentShader
-  // + spirv_cross::CompilerHLSL to do the real translation before D3DCompile).
-  std::printf("(expected) raw shadergen source is GLSL-flavored, not "
-              "direct HLSL -- see comment above main() return\n");
-  CompileHlsl(shaders.vertex, "main", "vs_5_0");
-  CompileHlsl(shaders.pixel, "main", "ps_5_0");
-  return 0;
+  // Phase 1b: run the real captured shadergen output through the real
+  // GLSL->SPIRV->HLSL->bytecode pipeline (glslang + spirv_cross::CompilerHLSL
+  // + D3DCompile), the same translation the real D3D11/D3D12 backends do --
+  // not a reimplementation of shader semantics, just standalone linkage of
+  // the same third-party libraries (see glsl_to_hlsl.hpp).
+  const bool vs_ok = CompileViaRealPipeline(shaders.vertex, moderngekko::GlslShaderKind::Vertex,
+                                            "main", "vs_5_0", "vertex shader");
+  const bool ps_ok = CompileViaRealPipeline(shaders.pixel, moderngekko::GlslShaderKind::Fragment,
+                                            "main", "ps_5_0", "pixel shader");
+  return (vs_ok && ps_ok) ? 0 : 1;
 }

@@ -87,6 +87,14 @@ if(MODERNGEKKO_ENABLE_DOLPHIN_RUNTIME)
     set(LINUX_LOCAL_DEV ON CACHE BOOL "" FORCE)
     set(DISTRIBUTOR "ModernGekko" CACHE STRING "" FORCE)
     add_subdirectory(vendor/dolphin EXCLUDE_FROM_ALL)
+    if(MSVC AND TARGET glslang-default-resource-limits)
+        # glslang's C resource-limits shim uses strncpy with /WX (warnings
+        # as errors) on, which MSVC's CRT deprecation warning turns fatal.
+        # This target wasn't previously reachable from any build here (only
+        # needed starting with Phase 1b's GLSL->SPIR-V->HLSL bridge).
+        target_compile_definitions(glslang-default-resource-limits PRIVATE
+            _CRT_SECURE_NO_WARNINGS)
+    endif()
     if(MODERNGEKKO_FRONTEND_SDK)
         # These two imported targets historically rely on X11 headers living
         # in the compiler's default /usr/include search path.
@@ -195,6 +203,33 @@ target_include_directories(moderngekko_dolphin_video
     PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src/dolphin_shims"
 )
 target_link_libraries(moderngekko_dolphin_video PUBLIC fmt::fmt)
+
+if(MODERNGEKKO_ENABLE_DOLPHIN_RUNTIME)
+    # Phase 1b: GLSL->SPIR-V->HLSL bridge, used to cross-compile
+    # DolphinShaderCompiler's real (but GLSL-flavored) shadergen output into
+    # HLSL that D3DCompile actually accepts -- see include/moderngekko/
+    # glsl_to_hlsl.hpp for why this is a standalone target rather than reusing
+    # vendor/dolphin's own D3DCommon::Shader::CompileShader (that pulls in the
+    # full modern Common/VideoCommon library, which redeclares the same
+    # global symbol names as the separate vendor/dolphin_legacy-based
+    # DolphinVideo target below -- linking both into one binary is an ODR
+    # violation / duplicate-symbol link error).
+    add_library(moderngekko_glsl_to_hlsl STATIC
+        src/gpu/glsl_to_hlsl.cpp
+    )
+    add_library(ModernGekko::GlslToHlsl ALIAS moderngekko_glsl_to_hlsl)
+    target_include_directories(moderngekko_glsl_to_hlsl
+        PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/include"
+    )
+    target_link_libraries(moderngekko_glsl_to_hlsl
+        PRIVATE glslang::glslang glslang::SPIRV glslang::glslang-default-resource-limits
+                spirv_cross
+    )
+    target_compile_features(moderngekko_glsl_to_hlsl PUBLIC cxx_std_23)
+    if(MSVC)
+        target_compile_options(moderngekko_glsl_to_hlsl PRIVATE /Zc:preprocessor)
+    endif()
+endif()
 
 target_link_libraries(moderngekko_legacy PUBLIC ModernGekko::ABI fmt::fmt)
 target_compile_features(moderngekko_legacy PUBLIC cxx_std_23)
@@ -693,7 +728,7 @@ if(BUILD_TESTING)
             tests/native_render_probe.cpp
         )
         target_link_libraries(moderngekko_native_render_probe
-            PRIVATE ModernGekko::DolphinVideo d3dcompiler.lib
+            PRIVATE ModernGekko::DolphinVideo ModernGekko::GlslToHlsl d3dcompiler.lib
         )
         add_test(NAME moderngekko.native_render_probe
                  COMMAND moderngekko_native_render_probe)
