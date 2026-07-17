@@ -30,7 +30,15 @@ public:
   void SubmitDecodedDraw(const GxDrawPacket& packet, const GxDecodedDraw& decoded,
                          const GxStateView& state) override;
 
-  bool Done() const { return m_draws_written >= m_max_draws; }
+  // The texture's TLUT is populated asynchronously by Dolphin's real video
+  // thread (see MaybeDumpTexture) and may lag behind the vertex captures by
+  // many draws, so texture completion is tracked separately with its own
+  // attempt budget rather than piggybacking on m_draws_written.
+  bool Done() const
+  {
+    return m_draws_written >= m_max_draws &&
+           (m_texture_written || m_texture_attempts >= m_max_texture_attempts);
+  }
 
 private:
   void MaybeDumpTexture(const GxStateView& state);
@@ -41,6 +49,8 @@ private:
   int m_max_draws = 16;
   int m_draws_written = 0;
   bool m_texture_written = false;
+  int m_texture_attempts = 0;
+  static constexpr int m_max_texture_attempts = 500;
 };
 
 // Opt-in via MODERNGEKKO_GX_VERTEX_DUMP=<path>. If MODERNGEKKO_GX_LOG is also

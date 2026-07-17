@@ -6,6 +6,7 @@
 #include "Core/HW/GPFifo.h"
 #include "Core/HW/Memmap.h"
 #include "Core/System.h"
+#include "VideoCommon/TextureDecoder.h"
 
 #include <algorithm>
 #include <cstdio>
@@ -41,23 +42,64 @@ void GxVertexDumpDevice::MaybeDumpTexture(const GxStateView& state)
               static_cast<unsigned>(format), address);
   if (width == 0 || height == 0 || width > 1024 || height > 1024)
     return;
-  // Paletted formats need a resolved TLUT we don't decode here yet -- skip
-  // rather than dump garbage; still counts as "attempted", not retried.
-  if (format == GxTextureFormat::C4 || format == GxTextureFormat::C8 ||
-      format == GxTextureFormat::C14X2)
+
+  // Paletted formats (C4/C8/C14X2) need a resolved TLUT. GX's real TLUT
+  // storage is TMEM, a separate 1MB region from main RAM -- BPMEM_LOADTLUT1
+  // copies palette bytes from main RAM into TMEM (see
+  // vendor/dolphin/.../BPStructs.cpp's BPMEM_LOADTLUT1 handler), and
+  // BPMEM_TX_SETTLUT (0x98 for unit 0) records which TMEM offset + format a
+  // texture unit's palette lives at. Since this probe hooks the raw GX FIFO
+  // in the SAME process as the real, live Dolphin video backend actually
+  // driving the game's real rendering, that real backend's BP handler has
+  // already populated the global s_tex_mem buffer for us by the time our
+  // observer sees these bytes -- we just read it directly instead of
+  // re-modeling TMEM/TLUT loads ourselves.
+  std::span<const std::uint8_t> palette;
+  GxPaletteFormat palette_format = GxPaletteFormat::IA8;
+  const bool is_paletted = (format == GxTextureFormat::C4 || format == GxTextureFormat::C8 ||
+                           format == GxTextureFormat::C14X2);
+  if (is_paletted)
   {
-    m_texture_written = true;
-    return;
+    if (state.bp.size() <= 0x98)
+      return;
+    const std::uint32_t settlut0 = state.bp[0x98];  // BPMEM_TX_SETTLUT, unit 0
+    const std::uint32_t tmem_addr = (settlut0 & 0x3FFu) << 9u;
+    palette_format = static_cast<GxPaletteFormat>((settlut0 >> 10u) & 0x3u);
+    const std::size_t palette_entries = GxTextureDecoder::PaletteEntries(format);
+    const std::size_t palette_bytes = palette_entries * 2u;
+    if (tmem_addr + palette_bytes > TMEM_SIZE)
+      return;
+    palette = std::span{s_tex_mem.data() + tmem_addr, palette_bytes};
+    // This probe's raw-FIFO observer sees GX command bytes as they're
+    // pushed to the FIFO (CPU-thread timing), but the real BP handler that
+    // actually populates s_tex_mem from BPMEM_LOADTLUT1 runs asynchronously
+    // on Dolphin's video/GPU thread and may not have caught up yet -- an
+    // all-zero palette region almost always means "not loaded yet" rather
+    // than a genuine all-black TLUT, so don't accept it as done; retry on
+    // a later draw instead (m_texture_written stays false).
+    const bool all_zero = std::all_of(palette.begin(), palette.end(),
+                                      [](std::uint8_t b) { return b == 0; });
+    if (all_zero)
+      return;
   }
 
   const std::size_t encoded_size = GxTextureDecoder::EncodedSize(width, height, format);
   const std::uint8_t* encoded = m_memory->Resolve(address, encoded_size);
   if (encoded == nullptr)
     return;
-
+  // A real texture whose encoded index/intensity bytes are all zero decodes
+  // to a flat single color. During an automated boot-only capture this seems
+  // to persistently land on the same placeholder/unused texture slot (tried
+  // with a large retry budget and up to ~60s of live capture without ever
+  // seeing non-zero index data here) -- likely something not populated until
+  // actual gameplay is reached, same as Phase 3's geometry capture needed a
+  // real interactive combat session rather than just the boot/menu flow.
+  // Accept it rather than retrying forever: still a real, correctly-resolved
+  // decode (verified: palette entry 0 correctly produced (14,14,14,7) from
+  // real TLUT bytes 07 0e), just not visually interesting art.
   GxDecodedTexture decoded;
-  if (!GxTextureDecoder::Decode(std::span{encoded, encoded_size}, width, height, format, {},
-                                GxPaletteFormat::IA8, &decoded))
+  if (!GxTextureDecoder::Decode(std::span{encoded, encoded_size}, width, height, format, palette,
+                                palette_format, &decoded))
     return;
 
   std::ofstream out(m_texture_path, std::ios::out | std::ios::trunc | std::ios::binary);
@@ -74,7 +116,14 @@ void GxVertexDumpDevice::SubmitDecodedDraw(const GxDrawPacket&, const GxDecodedD
   if (Done() || decoded.vertices.size() < 3)
     return;
 
-  MaybeDumpTexture(state);
+  if (!m_texture_written && m_texture_attempts < m_max_texture_attempts)
+  {
+    ++m_texture_attempts;
+    MaybeDumpTexture(state);
+  }
+
+  if (m_draws_written >= m_max_draws)
+    return;
 
   std::ofstream out(m_vertex_path, std::ios::out | (m_draws_written == 0 ? std::ios::trunc
                                                                           : std::ios::app));
