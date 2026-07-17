@@ -18,6 +18,7 @@
 #include "UICommon/UICommon.h"
 #include "VideoCommon/PerformanceMetrics.h"
 #include "moderngekko/cpu_state.h"
+#include "moderngekko/gx_logging_backend.hpp"
 #include "moderngekko/module_loader.hpp"
 
 #include <algorithm>
@@ -229,6 +230,11 @@ RuntimeCreateResult Runtime::Create(RuntimeConfig config)
   }
   Config::SetBase(Config::MAIN_AUDIO_BACKEND, impl->config.audio.backend);
   Config::SetBase(Config::MAIN_INPUT_BACKGROUND_INPUT, impl->config.input.background_input);
+
+  // Phase-0 native-renderer scoping: opt-in, read-only GX FIFO logging via
+  // MODERNGEKKO_GX_LOG=<path>. Purely observes the raw bytes Dolphin's own
+  // GPFifo already commits; does not participate in or alter rendering.
+  MaybeEnableGxFifoLogging();
 
   auto& jit = Core::System::GetInstance().GetJitInterface();
   if (impl->config.module.kind == ModuleSource::Kind::DynamicPath)

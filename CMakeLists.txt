@@ -205,6 +205,9 @@ target_link_libraries(moderngekko PUBLIC ModernGekko::ABI PRIVATE fmt::fmt)
 if(MODERNGEKKO_ENABLE_DOLPHIN_RUNTIME)
     target_sources(moderngekko PRIVATE
         src/runtime/dolphin_runtime.cpp
+        src/gpu/gx_command_processor.cpp
+        src/gpu/gx_logging_backend.cpp
+        src/memory/address_space.cpp
         vendor/dolphin/Source/Core/DolphinNoGUI/Platform.cpp
         vendor/dolphin/Source/Core/DolphinNoGUI/PlatformHeadless.cpp
     )
