@@ -8,6 +8,7 @@ endif()
 include(CTest)
 include(CheckIncludeFileCXX)
 
+
 if(WIN32)
     set(MODERNGEKKO_DYNAMIC_MODULES_DEFAULT ON)
 else()
@@ -146,6 +147,15 @@ add_library(moderngekko STATIC
     src/runtime/game.cpp
 )
 add_library(ModernGekko::Runtime ALIAS moderngekko)
+if(MSVC)
+    # This target compiles vendor/dolphin sources directly (dolphin_runtime.cpp,
+    # DolphinNoGUI/Platform*.cpp below), but vendor/dolphin/CMakeLists.txt only
+    # applies its MSVC flags (notably /Zc:preprocessor, needed for fmt's
+    # __VA_OPT__ macros) to targets defined in its own directory scope, not to
+    # sibling targets like this one that happen to include the same sources.
+    target_compile_options(moderngekko PRIVATE /Zc:preprocessor)
+    target_compile_definitions(moderngekko PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
+endif()
 
 add_library(moderngekko_dolphin_video STATIC
     src/gpu/dolphin_video_host.cpp
@@ -224,6 +234,15 @@ if(MODERNGEKKO_ENABLE_DOLPHIN_RUNTIME)
         target_compile_definitions(moderngekko PRIVATE _M_GENERIC=1)
     endif()
     target_link_libraries(moderngekko PRIVATE core uicommon)
+    if(WIN32)
+        # Dolphin's windowed backend for Windows (Win32/GDI + DWM)
+        target_sources(moderngekko PRIVATE
+            vendor/dolphin/Source/Core/DolphinNoGUI/PlatformWin32.cpp)
+        target_include_directories(moderngekko PRIVATE
+            "${CMAKE_CURRENT_SOURCE_DIR}/vendor/dolphin/Source/Core/DolphinNoGUI")
+        # needed for adjusting window decorations with DwmSetWindowAttribute
+        target_link_libraries(moderngekko PRIVATE dwmapi.lib)
+    endif()
     if(TARGET PkgConfig::X11)
         target_sources(moderngekko PRIVATE
             vendor/dolphin/Source/Core/DolphinNoGUI/PlatformX11.cpp)
@@ -395,6 +414,14 @@ if(MODERNGEKKO_ENABLE_DOLPHIN_RUNTIME)
             ModernGekko::Runtime discio imgui ${_moderngekko_sdl_target})
     endif()
     set_target_properties(moderngekko-launcher PROPERTIES OUTPUT_NAME "ModernGekko")
+    if(WIN32)
+        # Windows filesystems are case-insensitive: the launcher's renamed
+        # "ModernGekko.exe" would otherwise generate an import lib
+        # ("ModernGekko.lib") colliding with the "moderngekko" static
+        # library's own "moderngekko.lib" in the same output directory.
+        set_target_properties(moderngekko-launcher PROPERTIES
+            ARCHIVE_OUTPUT_NAME "moderngekko-launcher-import")
+    endif()
     if(MODERNGEKKO_FRONTEND_SDK)
         set_property(TARGET moderngekko-launcher PROPERTY BUILD_RPATH
             "${_moderngekko_sdk_lib}")
@@ -404,11 +431,22 @@ if(MODERNGEKKO_ENABLE_DOLPHIN_RUNTIME)
             INSTALL_RPATH "$ORIGIN/lib")
     endif()
     add_dependencies(moderngekko-launcher moderngekko-run)
+    if(MSVC)
+        # See the comment above the moderngekko target: this target's TUs pull
+        # in vendor/dolphin/Source/Core/Common headers (fmt __VA_OPT__ macros,
+        # etc.) without inheriting vendor/dolphin's own MSVC flags.
+        target_compile_options(moderngekko-launcher PRIVATE /Zc:preprocessor)
+        target_compile_definitions(moderngekko-launcher PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
+    endif()
 
     add_executable(moderngekko-port tools/moderngekko_port.cpp)
     target_link_libraries(moderngekko-port PRIVATE ModernGekko::Runtime)
     target_compile_definitions(moderngekko-port PRIVATE
         MODERNGEKKO_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
+    if(MSVC)
+        target_compile_options(moderngekko-port PRIVATE /Zc:preprocessor)
+        target_compile_definitions(moderngekko-port PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
+    endif()
     add_dependencies(moderngekko-port dolrecomp moderngekko-run)
     add_custom_command(TARGET moderngekko-port POST_BUILD
         COMMAND ${CMAKE_COMMAND} -E copy_if_different

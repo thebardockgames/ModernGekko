@@ -96,7 +96,20 @@ std::string ReadCommand(const std::string& command)
 bool RunCommand(const std::string& command)
 {
   std::cout << "+ " << command << '\n';
+#if defined(_WIN32)
+  // cmd.exe's /c parsing only preserves inner quotes verbatim when the whole
+  // command line has exactly two quote characters wrapping the executable
+  // name; otherwise it falls back to stripping just the very first and very
+  // last quote characters of the entire line (not matched pairs), which
+  // corrupts any command with more than one quoted argument -- exactly what
+  // every multi-path RunCommand call here builds. Wrapping the whole command
+  // in an extra pair of quotes means that fallback only strips our added
+  // wrapper, leaving the real quoting intact.
+  const std::string wrapped = "\"" + command + "\"";
+  return std::system(wrapped.c_str()) == 0;
+#else
   return std::system(command.c_str()) == 0;
+#endif
 }
 
 fs::path SiblingExecutable(const char* argv0, std::string name)
@@ -402,5 +415,5 @@ int main(int argc, char** argv)
                     Quote(root) + " --module " + Quote(*module);
   for (const std::string& arg : options.runner_arguments)
     run += " " + Quote(arg);
-  return std::system(run.c_str()) == 0 ? 0 : 1;
+  return RunCommand(run) ? 0 : 1;
 }

@@ -187,6 +187,10 @@ RuntimeCreateResult Runtime::Create(RuntimeConfig config)
   else if (impl->config.window_system != WindowSystem::X11)
     impl->platform = Platform::CreateWaylandPlatform();
 #endif
+#ifdef _WIN32
+  else
+    impl->platform = Platform::CreateWin32Platform();
+#endif
   if (!impl->platform || !impl->platform->Init())
   {
     UICommon::Shutdown();
