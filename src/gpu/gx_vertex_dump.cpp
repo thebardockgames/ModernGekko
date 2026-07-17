@@ -18,9 +18,10 @@
 namespace moderngekko
 {
 GxVertexDumpDevice::GxVertexDumpDevice(std::string vertex_path, std::string texture_path,
-                                       const AddressSpace* memory, int max_draws)
+                                       const AddressSpace* memory, int max_draws,
+                                       double skip_seconds)
     : m_vertex_path(std::move(vertex_path)), m_texture_path(std::move(texture_path)),
-      m_memory(memory), m_max_draws(max_draws)
+      m_memory(memory), m_max_draws(max_draws), m_skip_seconds(skip_seconds)
 {
 }
 
@@ -116,6 +117,14 @@ void GxVertexDumpDevice::SubmitDecodedDraw(const GxDrawPacket&, const GxDecodedD
   if (Done() || decoded.vertices.size() < 3)
     return;
 
+  if (m_skip_seconds > 0.0)
+  {
+    const double elapsed =
+        std::chrono::duration<double>(std::chrono::steady_clock::now() - m_start).count();
+    if (elapsed < m_skip_seconds)
+      return;
+  }
+
   if (!m_texture_written && m_texture_attempts < m_max_texture_attempts)
   {
     ++m_texture_attempts;
@@ -183,10 +192,13 @@ void MaybeEnableGxVertexDump()
   std::lock_guard<std::mutex> lock(s_gx_dump_mutex);
   if (s_gx_dump_processor)
     return;
+  double skip_seconds = 0.0;
+  if (const char* skip = std::getenv("MODERNGEKKO_GX_VERTEX_DUMP_SKIP_SECONDS"))
+    skip_seconds = std::atof(skip);
   s_gx_dump_memory = std::make_unique<AddressSpace>(true);
   s_gx_dump_state = std::make_unique<GxStateBackend>(*s_gx_dump_memory);
-  s_gx_dump_device = std::make_unique<GxVertexDumpDevice>(path, std::string(path) + ".tex",
-                                                          s_gx_dump_memory.get(), 300);
+  s_gx_dump_device = std::make_unique<GxVertexDumpDevice>(
+      path, std::string(path) + ".tex", s_gx_dump_memory.get(), 300, skip_seconds);
   s_gx_dump_state->SetRenderDevice(s_gx_dump_device.get());
   // Passing the memory snapshot here (unlike Phase 2b) lets display lists
   // actually resolve and decode -- previously ExecuteDisplayList() silently
