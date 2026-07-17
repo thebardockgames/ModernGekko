@@ -186,7 +186,7 @@ void MaybeEnableGxVertexDump()
   s_gx_dump_memory = std::make_unique<AddressSpace>(true);
   s_gx_dump_state = std::make_unique<GxStateBackend>(*s_gx_dump_memory);
   s_gx_dump_device = std::make_unique<GxVertexDumpDevice>(path, std::string(path) + ".tex",
-                                                          s_gx_dump_memory.get(), 16);
+                                                          s_gx_dump_memory.get(), 300);
   s_gx_dump_state->SetRenderDevice(s_gx_dump_device.get());
   // Passing the memory snapshot here (unlike Phase 2b) lets display lists
   // actually resolve and decode -- previously ExecuteDisplayList() silently
