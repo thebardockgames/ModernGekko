@@ -684,4 +684,18 @@ if(BUILD_TESTING)
     )
     add_test(NAME moderngekko.dolphin_shader
              COMMAND moderngekko_dolphin_shader_test)
+
+    if(WIN32)
+        # Phase 1 native-renderer probe: compiles Dolphin's real shader-gen
+        # output (driven by BP/TEV state captured from live BT3 gameplay)
+        # through the real D3D HLSL compiler. See tests/native_render_probe.cpp.
+        add_executable(moderngekko_native_render_probe
+            tests/native_render_probe.cpp
+        )
+        target_link_libraries(moderngekko_native_render_probe
+            PRIVATE ModernGekko::DolphinVideo d3dcompiler.lib
+        )
+        add_test(NAME moderngekko.native_render_probe
+                 COMMAND moderngekko_native_render_probe)
+    endif()
 endif()

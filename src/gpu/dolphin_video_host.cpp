@@ -54,10 +54,15 @@ void GenericLogFmtImpl(LogLevel, LogType, const char*, int, fmt::string_view,
 
 namespace Common
 {
+// ASSERT/ASSERT_MSG treat a `false` return here as "don't ignore" and call
+// Crash() (a hard __debugbreak()). This standalone shader-gen host has no UI
+// to show the panic dialog, so always "ignore and continue" instead of
+// hard-crashing on assertions triggered by real (possibly not fully modeled)
+// game state.
 bool MsgAlertFmtImpl(bool, MsgType, Log::LogType, const char*, int, fmt::string_view,
                      const fmt::format_args&)
 {
-  return false;
+  return true;
 }
 }
 
