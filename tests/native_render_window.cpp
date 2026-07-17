@@ -27,6 +27,9 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
+#include <optional>
+#include <sstream>
 #include <vector>
 
 #include <d3d12.h>
@@ -190,6 +193,55 @@ int ComponentsForMask(BYTE mask)
   case 0xF: return 4;
   default: return 4;
   }
+}
+
+// Phase 2b: real decoded geometry, captured from a live BT3 session via
+// MODERNGEKKO_GX_VERTEX_DUMP (see gx_vertex_dump.hpp/cpp) and written as a
+// plain-text dump by gx_vertex_dump.cpp. Loaded here instead of the
+// synthetic NDC triangle when the dump file is present, so this probe can
+// show real game geometry (not just a placeholder shape).
+struct RealGeometry
+{
+  std::vector<std::array<float, 3>> positions;  // raw GX vertex-space, not yet NDC
+  std::vector<std::uint32_t> indices;
+};
+
+std::optional<RealGeometry> LoadRealGeometry(const char* path)
+{
+  std::ifstream in(path);
+  if (!in)
+    return std::nullopt;
+  RealGeometry geo;
+  std::string line;
+  while (std::getline(in, line))
+  {
+    if (line.empty() || line[0] == '#' || line.rfind("topology", 0) == 0)
+      continue;
+    std::istringstream iss(line);
+    std::string tag;
+    iss >> tag;
+    if (tag == "v")
+    {
+      std::string pos_tok;
+      iss >> pos_tok;  // "pos=x,y,z"
+      const auto eq = pos_tok.find('=');
+      std::array<float, 3> p{0, 0, 0};
+      std::istringstream pss(pos_tok.substr(eq + 1));
+      std::string comp;
+      for (int c = 0; c < 3 && std::getline(pss, comp, ','); ++c)
+        p[c] = std::stof(comp);
+      geo.positions.push_back(p);
+    }
+    else if (tag == "i")
+    {
+      std::uint32_t idx = 0;
+      iss >> idx;
+      geo.indices.push_back(idx);
+    }
+  }
+  if (geo.positions.empty() || geo.indices.empty())
+    return std::nullopt;
+  return geo;
 }
 
 struct ReflectedResource
@@ -573,16 +625,57 @@ int RealMain()
   }
   std::printf("PSO created OK.\n");
 
-  // --- vertex buffer: NDC triangle. The real captured-state VS has multiple
+  // --- vertex buffer: real decoded BT3 geometry if a dump is available
+  // (MODERNGEKKO_GX_VERTEX_DUMP capture, see gx_vertex_dump.cpp), else the
+  // synthetic NDC triangle fallback. The real captured-state VS has multiple
   // input attributes (e.g. rawpos/rawcolor0/rawcolor1), not just a single
   // POSITION float3 like the old synthetic shader, so fill generically from
-  // the reflected layout: first attribute gets the NDC triangle position
-  // (padded with 1.0f to its component count), every other attribute is
-  // filled with 1.0f per component (same convention as the cbuffer fill
-  // above).
-  const float ndc[3][3] = {{0.0f, 0.5f, 0.0f}, {0.5f, -0.5f, 0.0f}, {-0.5f, -0.5f, 0.0f}};
+  // the reflected layout: first attribute gets the real/NDC position (padded
+  // with 1.0f to its component count), every other attribute is filled with
+  // 1.0f per component (same convention as the cbuffer fill above).
+  const char* dump_path = std::getenv("MODERNGEKKO_REAL_GEOMETRY_DUMP");
+  const std::optional<RealGeometry> real_geo =
+      LoadRealGeometry(dump_path ? dump_path : "gx_vertex_dump.txt");
+
+  std::vector<std::array<float, 3>> ndc_positions;
+  std::vector<std::uint32_t> draw_indices;
+  if (real_geo)
+  {
+    // Raw GX vertex-space coordinates (e.g. 0..128, 0..224 for a UI/HUD
+    // quad) aren't NDC -- normalize to a [-1, 1] box using the real
+    // geometry's own bounding box so it's visible regardless of the
+    // source draw call's coordinate range, flipping Y since GX's origin
+    // is top-left while D3D NDC's +Y is up.
+    float min_x = real_geo->positions[0][0], max_x = min_x;
+    float min_y = real_geo->positions[0][1], max_y = min_y;
+    for (const auto& p : real_geo->positions)
+    {
+      min_x = std::min(min_x, p[0]);
+      max_x = std::max(max_x, p[0]);
+      min_y = std::min(min_y, p[1]);
+      max_y = std::max(max_y, p[1]);
+    }
+    const float span_x = (max_x - min_x) > 1e-3f ? (max_x - min_x) : 1.0f;
+    const float span_y = (max_y - min_y) > 1e-3f ? (max_y - min_y) : 1.0f;
+    for (const auto& p : real_geo->positions)
+    {
+      const float nx = ((p[0] - min_x) / span_x) * 1.6f - 0.8f;
+      const float ny = -(((p[1] - min_y) / span_y) * 1.6f - 0.8f);
+      ndc_positions.push_back({nx, ny, 0.0f});
+    }
+    draw_indices = real_geo->indices;
+    std::printf("using REAL decoded geometry: %zu vertices, %zu indices (from %s)\n",
+                ndc_positions.size(), draw_indices.size(), dump_path ? dump_path : "gx_vertex_dump.txt");
+  }
+  else
+  {
+    ndc_positions = {{0.0f, 0.5f, 0.0f}, {0.5f, -0.5f, 0.0f}, {-0.5f, -0.5f, 0.0f}};
+    draw_indices = {0, 1, 2};
+    std::printf("no real geometry dump found, using synthetic NDC triangle fallback\n");
+  }
+
   std::vector<float> vertex_data;
-  for (int v = 0; v < 3; ++v)
+  for (std::size_t v = 0; v < ndc_positions.size(); ++v)
   {
     for (std::size_t attr = 0; attr < vs_stage.input_components.size(); ++attr)
     {
@@ -590,7 +683,7 @@ int RealMain()
       for (int c = 0; c < components; ++c)
       {
         if (attr == 0)
-          vertex_data.push_back(c < 3 ? ndc[v][c] : 1.0f);
+          vertex_data.push_back(c < 3 ? ndc_positions[v][c] : 1.0f);
         else
           vertex_data.push_back(1.0f);
       }
@@ -621,6 +714,31 @@ int RealMain()
   vbv.BufferLocation = vertex_buffer->GetGPUVirtualAddress();
   vbv.SizeInBytes = vb_size;
   vbv.StrideInBytes = vertex_stride;
+
+  const UINT ib_size = static_cast<UINT>(draw_indices.size() * sizeof(std::uint32_t));
+  ComPtr<ID3D12Resource> index_buffer;
+  {
+    D3D12_HEAP_PROPERTIES heap{D3D12_HEAP_TYPE_UPLOAD};
+    D3D12_RESOURCE_DESC rdesc{};
+    rdesc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    rdesc.Width = ib_size;
+    rdesc.Height = 1;
+    rdesc.DepthOrArraySize = 1;
+    rdesc.MipLevels = 1;
+    rdesc.SampleDesc.Count = 1;
+    rdesc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &rdesc,
+                                    D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
+                                    IID_PPV_ARGS(&index_buffer));
+    void* mapped = nullptr;
+    index_buffer->Map(0, nullptr, &mapped);
+    std::memcpy(mapped, draw_indices.data(), ib_size);
+    index_buffer->Unmap(0, nullptr);
+  }
+  D3D12_INDEX_BUFFER_VIEW ibv{};
+  ibv.BufferLocation = index_buffer->GetGPUVirtualAddress();
+  ibv.SizeInBytes = ib_size;
+  ibv.Format = DXGI_FORMAT_R32_UINT;
 
   // --- constant buffers (1.0f fill + identity for any reflected mat4) ---
   auto make_cbv_buffer = [&](UINT size) {
@@ -921,7 +1039,8 @@ int RealMain()
 
     cl->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     cl->IASetVertexBuffers(0, 1, &vbv);
-    cl->DrawInstanced(3, 1, 0, 0);
+    cl->IASetIndexBuffer(&ibv);
+    cl->DrawIndexedInstanced(static_cast<UINT>(draw_indices.size()), 1, 0, 0, 0);
 
     D3D12_RESOURCE_BARRIER to_present = to_rt;
     to_present.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;

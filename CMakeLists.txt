@@ -242,6 +242,9 @@ if(MODERNGEKKO_ENABLE_DOLPHIN_RUNTIME)
         src/runtime/dolphin_runtime.cpp
         src/gpu/gx_command_processor.cpp
         src/gpu/gx_logging_backend.cpp
+        src/gpu/gx_state_backend.cpp
+        src/gpu/gx_vertex_loader.cpp
+        src/gpu/gx_vertex_dump.cpp
         src/memory/address_space.cpp
         vendor/dolphin/Source/Core/DolphinNoGUI/Platform.cpp
         vendor/dolphin/Source/Core/DolphinNoGUI/PlatformHeadless.cpp

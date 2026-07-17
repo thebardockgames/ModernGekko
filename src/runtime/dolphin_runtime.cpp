@@ -19,6 +19,7 @@
 #include "VideoCommon/PerformanceMetrics.h"
 #include "moderngekko/cpu_state.h"
 #include "moderngekko/gx_logging_backend.hpp"
+#include "moderngekko/gx_vertex_dump.hpp"
 #include "moderngekko/module_loader.hpp"
 
 #include <algorithm>
@@ -235,6 +236,9 @@ RuntimeCreateResult Runtime::Create(RuntimeConfig config)
   // MODERNGEKKO_GX_LOG=<path>. Purely observes the raw bytes Dolphin's own
   // GPFifo already commits; does not participate in or alter rendering.
   MaybeEnableGxFifoLogging();
+  // Phase 2b: opt-in real-decoded-vertex dump via
+  // MODERNGEKKO_GX_VERTEX_DUMP=<path>. See gx_vertex_dump.hpp.
+  MaybeEnableGxVertexDump();
 
   auto& jit = Core::System::GetInstance().GetJitInterface();
   if (impl->config.module.kind == ModuleSource::Kind::DynamicPath)
