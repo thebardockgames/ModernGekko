@@ -190,6 +190,8 @@ std::unique_ptr<GxStateBackend> s_gx_dump_state;
 std::unique_ptr<GxVertexDumpDevice> s_gx_dump_device;
 std::unique_ptr<GxCommandProcessor> s_gx_dump_processor;
 
+std::chrono::steady_clock::time_point s_last_mem_refresh{};
+
 void OnRawFifoBytesForDump(const std::uint8_t* data, std::size_t size)
 {
   std::lock_guard<std::mutex> lock(s_gx_dump_mutex);
@@ -198,15 +200,25 @@ void OnRawFifoBytesForDump(const std::uint8_t* data, std::size_t size)
 
   // Refresh our private memory snapshot from the real running game's RAM
   // right before parsing more FIFO bytes, so indexed vertex-array reads and
-  // display-list contents resolve against real, current game data. A
-  // few-MB memcpy per FIFO batch is fine for a short one-shot debug
-  // capture; this is not meant to run for a full play session.
-  auto& memory = Core::System::GetInstance().GetMemory();
-  if (const std::uint8_t* mem1 = memory.GetPointerForRange(0, AddressSpace::RetailMem1Size))
+  // display-list contents resolve against real, current game data. This
+  // full-Mem1 memcpy was fine when capture always finished within the first
+  // few draws (Phase 2b-5), but Phase 6's background/UI filter can keep
+  // capture running for the length of an entire play session while most
+  // draws get rejected -- doing this multi-MB copy on every single FIFO
+  // batch for that whole duration visibly slows the game down. Throttle it
+  // to at most once every 8ms (~1 refresh per rendered frame at 60fps)
+  // instead of once per FIFO batch (there are many batches per frame).
+  const auto now = std::chrono::steady_clock::now();
+  if (now - s_last_mem_refresh >= std::chrono::milliseconds(8))
   {
-    auto dst = s_gx_dump_memory->GetMem1();
-    std::memcpy(dst.data(), mem1,
-                std::min(dst.size(), static_cast<std::size_t>(AddressSpace::RetailMem1Size)));
+    s_last_mem_refresh = now;
+    auto& memory = Core::System::GetInstance().GetMemory();
+    if (const std::uint8_t* mem1 = memory.GetPointerForRange(0, AddressSpace::RetailMem1Size))
+    {
+      auto dst = s_gx_dump_memory->GetMem1();
+      std::memcpy(dst.data(), mem1,
+                  std::min(dst.size(), static_cast<std::size_t>(AddressSpace::RetailMem1Size)));
+    }
   }
   s_gx_dump_processor->WriteBytes(std::span{data, size});
 }
