@@ -57,6 +57,8 @@ private:
   static constexpr int m_max_texture_attempts = 500;
   std::chrono::steady_clock::time_point m_start = std::chrono::steady_clock::now();
   double m_skip_seconds = 0.0;
+  int m_scanned = 0;
+  static constexpr int m_max_scanned = 100000;
 };
 
 // Opt-in via MODERNGEKKO_GX_VERTEX_DUMP=<path>. If MODERNGEKKO_GX_LOG is also

@@ -111,6 +111,27 @@ void GxVertexDumpDevice::MaybeDumpTexture(const GxStateView& state)
   m_texture_written = true;
 }
 
+namespace
+{
+// Every capture attempt so far (Phase 4's automated boot-only run, and
+// Phase 5b's interactively-played real combat, both starting well past the
+// menu flow) landed on the exact same flat, near-black UI/background tile
+// mosaic: 36 unique vertices, every one colored either 0x80808080 or
+// 0xffffffff. Real character/effect shading is expected to vary per vertex,
+// so treat a draw where every vertex shares one of these two exact colors
+// as "probably background/UI, keep scanning" rather than capture it.
+bool LooksLikeFlatBackgroundDraw(const GxDecodedDraw& decoded)
+{
+  if (decoded.vertices.empty())
+    return false;
+  const std::uint32_t first = decoded.vertices.front().color[0];
+  if (first != 0x80808080u && first != 0xFFFFFFFFu)
+    return false;
+  return std::all_of(decoded.vertices.begin(), decoded.vertices.end(),
+                     [first](const auto& v) { return v.color[0] == first; });
+}
+}
+
 void GxVertexDumpDevice::SubmitDecodedDraw(const GxDrawPacket&, const GxDecodedDraw& decoded,
                                            const GxStateView& state)
 {
@@ -124,6 +145,13 @@ void GxVertexDumpDevice::SubmitDecodedDraw(const GxDrawPacket&, const GxDecodedD
     if (elapsed < m_skip_seconds)
       return;
   }
+
+  // Give up filtering after a large number of scanned (but rejected) draws,
+  // so a session that's genuinely all-UI (e.g. stuck on a menu) still
+  // produces *something* instead of capturing forever.
+  ++m_scanned;
+  if (LooksLikeFlatBackgroundDraw(decoded) && m_scanned < m_max_scanned)
+    return;
 
   if (!m_texture_written && m_texture_attempts < m_max_texture_attempts)
   {
