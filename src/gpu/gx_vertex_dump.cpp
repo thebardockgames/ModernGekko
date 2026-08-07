@@ -113,22 +113,28 @@ void GxVertexDumpDevice::MaybeDumpTexture(const GxStateView& state)
 
 namespace
 {
-// Every capture attempt so far (Phase 4's automated boot-only run, and
-// Phase 5b's interactively-played real combat, both starting well past the
-// menu flow) landed on the exact same flat, near-black UI/background tile
-// mosaic: 36 unique vertices, every one colored either 0x80808080 or
-// 0xffffffff. Real character/effect shading is expected to vary per vertex,
-// so treat a draw where every vertex shares one of these two exact colors
-// as "probably background/UI, keep scanning" rather than capture it.
+// Every capture attempt so far (Phase 4's automated boot-only run, Phase
+// 5b's interactively-played real combat, and a Phase 6 re-capture with an
+// exact-color filter already active) landed on the same flat, near-black
+// UI/background tile mosaic. Phase 6's exact-match filter (0x80808080 /
+// 0xffffffff) missed a variant of it where the RGB portion is still the
+// same flat 0x808080 on every vertex but the alpha animates per tile
+// (0x80808008 .. 0x80808077 seen in one capture -- almost certainly a
+// fullscreen fade/wipe transition effect). Real per-vertex mesh shading is
+// expected to vary RGB, not just alpha, so compare only the RGB portion
+// (top 3 bytes) and ignore alpha -- this also generalizes past just the two
+// specific colors seen so far, since ANY draw with zero RGB variance across
+// its vertices is more likely flat lighting/UI than real shaded geometry.
 bool LooksLikeFlatBackgroundDraw(const GxDecodedDraw& decoded)
 {
   if (decoded.vertices.empty())
     return false;
-  const std::uint32_t first = decoded.vertices.front().color[0];
-  if (first != 0x80808080u && first != 0xFFFFFFFFu)
+  constexpr std::uint32_t kRgbMask = 0xFFFFFF00u;
+  const std::uint32_t first_rgb = decoded.vertices.front().color[0] & kRgbMask;
+  if (first_rgb != 0x80808000u && first_rgb != 0xFFFFFF00u)
     return false;
   return std::all_of(decoded.vertices.begin(), decoded.vertices.end(),
-                     [first](const auto& v) { return v.color[0] == first; });
+                     [first_rgb](const auto& v) { return (v.color[0] & kRgbMask) == first_rgb; });
 }
 }
 
