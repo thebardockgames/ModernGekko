@@ -25,30 +25,74 @@ GxVertexDumpDevice::GxVertexDumpDevice(std::string vertex_path, std::string text
 {
 }
 
+namespace
+{
+// A decode that's fully transparent (alpha 0 everywhere) or a single flat
+// RGBA value throughout isn't useful evidence even though it's a genuinely,
+// correctly-resolved real texture (Phase 4/6 confirmed the resolution math
+// itself is correct) -- BT3 binds up to 8 texture units per draw (Phase 0),
+// and unit 0 in particular has repeatedly turned out to be an incidental/
+// empty binding (a blank font-atlas slot, in one real capture) rather than
+// the unit actually carrying visible art for that draw.
+bool LooksDegenerate(const GxDecodedTexture& decoded)
+{
+  if (decoded.rgba8.empty())
+    return true;
+  const std::uint32_t first = decoded.rgba8.front();
+  const bool all_same =
+      std::all_of(decoded.rgba8.begin(), decoded.rgba8.end(),
+                  [first](std::uint32_t px) { return px == first; });
+  if (all_same)
+    return true;
+  constexpr std::uint32_t kAlphaMask = 0xFF000000u;
+  return std::all_of(decoded.rgba8.begin(), decoded.rgba8.end(),
+                     [](std::uint32_t px) { return (px & kAlphaMask) == 0; });
+}
+}
+
 void GxVertexDumpDevice::MaybeDumpTexture(const GxStateView& state)
 {
   if (m_texture_written || m_memory == nullptr || state.bp.size() < 0x98)
     return;
 
-  // Texture unit 0's TexImage0 (dimensions/format) and TexImage3 (base
-  // address) -- see vendor/dolphin_legacy/VideoCommon/BPMemory.h
-  // BPMEM_TX_SETIMAGE0/3 (0x88/0x94, +unit for units 1-3).
-  const std::uint32_t image0 = state.bp[0x88];
-  const std::uint32_t image3 = state.bp[0x94];
+  // BT3 can bind up to 8 texture units per draw (units 0-3 image0 at BP
+  // 0x88-0x8B, units 4-7 at 0xAC-0xAF -- see vendor/dolphin_legacy's
+  // BPMemory.h BPMEM_TX_SETIMAGE0). Only scan units 0-3 (the "first"
+  // texture-coordinate-generator group): the common case for a single
+  // material's primary texture, and enough to escape the specific "unit 0
+  // was blank" case seen in a real capture without a lot of extra
+  // complexity for units that are typically detail/lightmap layers anyway.
+  for (std::uint32_t unit = 0; unit < 4; ++unit)
+  {
+    if (TryDumpTextureUnit(state, unit))
+    {
+      m_texture_written = true;
+      return;
+    }
+  }
+}
+
+bool GxVertexDumpDevice::TryDumpTextureUnit(const GxStateView& state, std::uint32_t unit)
+{
+  // TexImage0 (dimensions/format) and TexImage3 (base address) -- see
+  // vendor/dolphin_legacy/VideoCommon/BPMemory.h BPMEM_TX_SETIMAGE0/3
+  // (0x88/0x94, +unit for units 1-3).
+  const std::uint32_t image0 = state.bp[0x88u + unit];
+  const std::uint32_t image3 = state.bp[0x94u + unit];
   const std::uint32_t width = (image0 & 0x3FFu) + 1u;
   const std::uint32_t height = ((image0 >> 10) & 0x3FFu) + 1u;
   const auto format = static_cast<GxTextureFormat>((image0 >> 20) & 0xFu);
   const std::uint32_t address = (image3 & 0xFFFFFFu) << 5u;
-  std::fprintf(stderr, "[gx_vertex_dump] tex0: %ux%u format=0x%x addr=0x%08x\n", width, height,
-              static_cast<unsigned>(format), address);
+  std::fprintf(stderr, "[gx_vertex_dump] tex%u: %ux%u format=0x%x addr=0x%08x\n", unit, width,
+              height, static_cast<unsigned>(format), address);
   if (width == 0 || height == 0 || width > 1024 || height > 1024)
-    return;
+    return false;
 
   // Paletted formats (C4/C8/C14X2) need a resolved TLUT. GX's real TLUT
   // storage is TMEM, a separate 1MB region from main RAM -- BPMEM_LOADTLUT1
   // copies palette bytes from main RAM into TMEM (see
   // vendor/dolphin/.../BPStructs.cpp's BPMEM_LOADTLUT1 handler), and
-  // BPMEM_TX_SETTLUT (0x98 for unit 0) records which TMEM offset + format a
+  // BPMEM_TX_SETTLUT (0x98, +unit) records which TMEM offset + format a
   // texture unit's palette lives at. Since this probe hooks the raw GX FIFO
   // in the SAME process as the real, live Dolphin video backend actually
   // driving the game's real rendering, that real backend's BP handler has
@@ -61,15 +105,15 @@ void GxVertexDumpDevice::MaybeDumpTexture(const GxStateView& state)
                            format == GxTextureFormat::C14X2);
   if (is_paletted)
   {
-    if (state.bp.size() <= 0x98)
-      return;
-    const std::uint32_t settlut0 = state.bp[0x98];  // BPMEM_TX_SETTLUT, unit 0
-    const std::uint32_t tmem_addr = (settlut0 & 0x3FFu) << 9u;
-    palette_format = static_cast<GxPaletteFormat>((settlut0 >> 10u) & 0x3u);
+    if (state.bp.size() <= 0x98u + unit)
+      return false;
+    const std::uint32_t settlut = state.bp[0x98u + unit];  // BPMEM_TX_SETTLUT
+    const std::uint32_t tmem_addr = (settlut & 0x3FFu) << 9u;
+    palette_format = static_cast<GxPaletteFormat>((settlut >> 10u) & 0x3u);
     const std::size_t palette_entries = GxTextureDecoder::PaletteEntries(format);
     const std::size_t palette_bytes = palette_entries * 2u;
     if (tmem_addr + palette_bytes > TMEM_SIZE)
-      return;
+      return false;
     palette = std::span{s_tex_mem.data() + tmem_addr, palette_bytes};
     // This probe's raw-FIFO observer sees GX command bytes as they're
     // pushed to the FIFO (CPU-thread timing), but the real BP handler that
@@ -77,38 +121,34 @@ void GxVertexDumpDevice::MaybeDumpTexture(const GxStateView& state)
     // on Dolphin's video/GPU thread and may not have caught up yet -- an
     // all-zero palette region almost always means "not loaded yet" rather
     // than a genuine all-black TLUT, so don't accept it as done; retry on
-    // a later draw instead (m_texture_written stays false).
+    // a later draw instead.
     const bool all_zero = std::all_of(palette.begin(), palette.end(),
                                       [](std::uint8_t b) { return b == 0; });
     if (all_zero)
-      return;
+      return false;
   }
 
   const std::size_t encoded_size = GxTextureDecoder::EncodedSize(width, height, format);
   const std::uint8_t* encoded = m_memory->Resolve(address, encoded_size);
   if (encoded == nullptr)
-    return;
-  // A real texture whose encoded index/intensity bytes are all zero decodes
-  // to a flat single color. During an automated boot-only capture this seems
-  // to persistently land on the same placeholder/unused texture slot (tried
-  // with a large retry budget and up to ~60s of live capture without ever
-  // seeing non-zero index data here) -- likely something not populated until
-  // actual gameplay is reached, same as Phase 3's geometry capture needed a
-  // real interactive combat session rather than just the boot/menu flow.
-  // Accept it rather than retrying forever: still a real, correctly-resolved
-  // decode (verified: palette entry 0 correctly produced (14,14,14,7) from
-  // real TLUT bytes 07 0e), just not visually interesting art.
+    return false;
   GxDecodedTexture decoded;
   if (!GxTextureDecoder::Decode(std::span{encoded, encoded_size}, width, height, format, palette,
                                 palette_format, &decoded))
-    return;
+    return false;
+
+  // Correctly decoded but visually empty (flat color, or fully transparent)
+  // -- real content, just not evidence worth keeping. Try the next unit /
+  // a later draw instead of accepting the first thing that resolves.
+  if (LooksDegenerate(decoded))
+    return false;
 
   std::ofstream out(m_texture_path, std::ios::out | std::ios::trunc | std::ios::binary);
   const std::uint32_t header[2] = {decoded.width, decoded.height};
   out.write(reinterpret_cast<const char*>(header), sizeof(header));
   out.write(reinterpret_cast<const char*>(decoded.rgba8.data()),
            static_cast<std::streamsize>(decoded.rgba8.size() * sizeof(std::uint32_t)));
-  m_texture_written = true;
+  return true;
 }
 
 namespace

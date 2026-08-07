@@ -46,6 +46,9 @@ public:
 
 private:
   void MaybeDumpTexture(const GxStateView& state);
+  // Returns true and writes m_texture_path if this unit resolves to a
+  // real, non-degenerate (not flat/fully-transparent) texture.
+  bool TryDumpTextureUnit(const GxStateView& state, std::uint32_t unit);
 
   std::string m_vertex_path;
   std::string m_texture_path;
