@@ -205,6 +205,7 @@ int ComponentsForMask(BYTE mask)
 struct RealGeometry
 {
   std::vector<std::array<float, 3>> positions;  // raw GX vertex-space, not yet NDC
+  std::vector<std::array<float, 4>> colors;      // RGBA, normalized 0..1, parallel to positions
   std::vector<std::uint32_t> indices;
 };
 
@@ -237,15 +238,36 @@ std::optional<RealGeometry> LoadRealGeometry(const char* path)
     iss >> tag;
     if (tag == "v")
     {
-      std::string pos_tok;
-      iss >> pos_tok;  // "pos=x,y,z"
-      const auto eq = pos_tok.find('=');
+      std::string pos_tok, uv_tok, color_tok;
+      iss >> pos_tok >> uv_tok >> color_tok;  // "pos=x,y,z" "uv0=u,v" "color0=0xRRGGBBAA"
+      const auto pos_eq = pos_tok.find('=');
       std::array<float, 3> p{0, 0, 0};
-      std::istringstream pss(pos_tok.substr(eq + 1));
+      std::istringstream pss(pos_tok.substr(pos_eq + 1));
       std::string comp;
       for (int c = 0; c < 3 && std::getline(pss, comp, ','); ++c)
         p[c] = std::stof(comp);
       geo.positions.push_back(p);
+
+      // color0=0xRRGGBBAA -> normalized RGBA floats. Real per-vertex color
+      // is what actually gives captured UI/HUD geometry its visible tint
+      // (Phase 7b's opaque-white texture times this color is how the real
+      // TEV combiner produces the final pixel) -- a prior version of this
+      // probe never parsed this field at all and always fed a hardcoded
+      // 1.0f (opaque white) for every non-position attribute, silently
+      // discarding real, varied color data and rendering everything flat
+      // white regardless of what was actually captured.
+      std::array<float, 4> color{1.0f, 1.0f, 1.0f, 1.0f};
+      const auto color_eq = color_tok.find("0x");
+      if (color_eq != std::string::npos)
+      {
+        const std::uint32_t packed =
+            static_cast<std::uint32_t>(std::stoul(color_tok.substr(color_eq + 2), nullptr, 16));
+        color[0] = static_cast<float>((packed >> 24) & 0xFFu) / 255.0f;
+        color[1] = static_cast<float>((packed >> 16) & 0xFFu) / 255.0f;
+        color[2] = static_cast<float>((packed >> 8) & 0xFFu) / 255.0f;
+        color[3] = static_cast<float>(packed & 0xFFu) / 255.0f;
+      }
+      geo.colors.push_back(color);
     }
     else if (tag == "i")
     {
@@ -501,7 +523,11 @@ int RealMain()
   }
   for (std::size_t i = 0; i < vs_stage.input_layout.size(); ++i)
     vs_stage.input_layout[i].SemanticName = semantic_storage[i].c_str();
+  vs_stage.input_semantics = semantic_storage;
   const UINT vertex_stride = running_offset;
+  for (std::size_t i = 0; i < semantic_storage.size(); ++i)
+    std::printf("VS input attr %zu: semantic=%s components=%d\n", i, semantic_storage[i].c_str(),
+                vs_stage.input_components[i]);
 
   ReflectResources(vs_refl.Get(), &vs_stage);
   ReflectResources(ps_refl.Get(), &ps_stage);
@@ -810,10 +836,19 @@ int RealMain()
     for (std::size_t attr = 0; attr < vs_stage.input_components.size(); ++attr)
     {
       const int components = vs_stage.input_components[attr];
+      // spirv_cross's HLSL backend gives every non-SV_ vertex input a
+      // generic TEXCOORDn semantic (confirmed by dumping them: all 3
+      // attributes here report semantic=TEXCOORD), so there's no name to
+      // match against -- fall back to Dolphin's known real vertex-shader
+      // input order instead (rawpos, then rawcolor0, then rawcolor1; see
+      // VertexShaderGen.cpp), i.e. attribute index 1 is color0.
+      const bool is_color = (attr == 1);
       for (int c = 0; c < components; ++c)
       {
         if (attr == 0)
           vertex_data.push_back(c < 3 ? ndc_positions[v][c] : 1.0f);
+        else if (is_color && real_geo && v < real_geo->colors.size())
+          vertex_data.push_back(real_geo->colors[v][c < 4 ? c : 3]);
         else
           vertex_data.push_back(1.0f);
       }
