@@ -38,12 +38,17 @@ bool LooksDegenerate(const GxDecodedTexture& decoded)
 {
   if (decoded.rgba8.empty())
     return true;
-  const std::uint32_t first = decoded.rgba8.front();
-  const bool all_same =
-      std::all_of(decoded.rgba8.begin(), decoded.rgba8.end(),
-                  [first](std::uint32_t px) { return px == first; });
-  if (all_same)
-    return true;
+  // Only reject fully-transparent decodes (genuinely invisible, like Phase
+  // 7's blank 512x32 font-atlas slot). A flat but OPAQUE texture (e.g. a
+  // solid white 1x1/4x4 tile) is a real, common UI technique -- the texture
+  // supplies alpha/shape while per-vertex color supplies the actual visible
+  // color, and this session's real captured vertex colors already vary a
+  // lot (Phase 6c found real RGB gradients), so rejecting flat-but-opaque
+  // textures here was throwing away perfectly valid, visible content: a
+  // live re-capture with the stricter "reject any flat color" version of
+  // this check found EVERY one of 500 texture-scan attempts across all 4
+  // units rejected, exhausting the attempt budget without ever writing a
+  // texture at all.
   constexpr std::uint32_t kAlphaMask = 0xFF000000u;
   return std::all_of(decoded.rgba8.begin(), decoded.rgba8.end(),
                      [](std::uint32_t px) { return (px & kAlphaMask) == 0; });
