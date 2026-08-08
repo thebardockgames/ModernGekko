@@ -22,8 +22,10 @@
 #include "moderngekko/dolphin_shader_compiler.hpp"
 #include "moderngekko/glsl_to_hlsl.hpp"
 
+#include <algorithm>
 #include <array>
 #include <cctype>
+#include <span>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -32,6 +34,8 @@
 #include <optional>
 #include <sstream>
 #include <string>
+#include <unordered_map>
+#include <utility>
 #include <vector>
 
 #include <d3d12.h>
@@ -81,32 +85,25 @@ void Fail(const char* what, HRESULT hr = S_OK)
   std::exit(1);
 }
 
-ComPtr<ID3DBlob> CompileFromCapturedState(std::string_view* out_vs_src, std::string_view* out_ps_src,
-                                          std::string* vs_hlsl_storage, std::string* ps_hlsl_storage,
-                                          ComPtr<ID3DBlob>* out_ps_blob)
+// Phase 8: generalized from the original CompileFromCapturedState (which
+// hardcoded one fixed reference BP/TEV snapshot and used Fail()/exit(1) on
+// any error) to accept ANY real captured cp/xf/bp state and report failure
+// via return value instead of aborting the whole probe -- some captured
+// states may legitimately fail to shader-gen or compile (incomplete
+// register data, exotic TEV features not yet handled), and one bad state
+// shouldn't prevent every OTHER draw's own real shader from working.
+bool CompileShaderForState(std::span<const std::uint32_t> cp, std::span<const std::uint32_t> xf,
+                           std::span<const std::uint32_t> bp, std::string* vs_hlsl_storage,
+                           std::string* ps_hlsl_storage, ComPtr<ID3DBlob>* out_vs_blob,
+                           ComPtr<ID3DBlob>* out_ps_blob)
 {
-  std::array<std::uint32_t, 256> cp{};
-  std::array<std::uint32_t, 0x1058> xf{};
-  std::array<std::uint32_t, 256> bp{};
-  cp[0x50u] = (1u << 13u) | (1u << 15u);
-  // XFMEM_SETNUMTEXGENS (0x103f): VertexShaderGen reads its texgen count from
-  // this XF register, while PixelShaderGen reads BP's GENMODE.numtexgens
-  // below -- two independent state entries that the real game always keeps
-  // in sync. Leaving this zeroed (as this synthetic probe state originally
-  // did) makes the VS emit 0 texcoords while the PS still expects 1, which is
-  // what actually caused "Signatures between stages are incompatible" --
-  // not a spirv_cross per-stage cross-compilation bug.
-  xf[0x103fu] = 1u;
-  bp[0x00u] = 0x4001;   // GENMODE (captured from live BT3 combat)
-  bp[0x28u] = 0x49040;  // TREF (captured)
-  bp[0x41u] = 0x4a0;    // BLENDMODE (captured)
-  bp[0xC0u] = 0x8fff8;  // TEV_COLOR_ENV stage 0 (captured)
-  bp[0xC1u] = 0x8ffc0;  // TEV_ALPHA_ENV stage 0 (captured)
-
   const moderngekko::DolphinShaderBundle shaders = moderngekko::DolphinShaderCompiler::Compile(
       {cp, xf, bp}, moderngekko::GxTopology::Triangles, 0, moderngekko::DolphinShaderApi::D3d);
   if (shaders.vertex.empty() || shaders.pixel.empty())
-    Fail("shader generation produced empty source");
+  {
+    std::fprintf(stderr, "shader generation produced empty source\n");
+    return false;
+  }
 
   const std::string vs_full = std::string(kShaderHeader) + shaders.vertex;
   const std::string ps_full = std::string(kShaderHeader) + shaders.pixel;
@@ -114,7 +111,10 @@ ComPtr<ID3DBlob> CompileFromCapturedState(std::string_view* out_vs_src, std::str
   const auto vs_hlsl = moderngekko::TranslateGlslToHlsl(vs_full, moderngekko::GlslShaderKind::Vertex);
   const auto ps_hlsl = moderngekko::TranslateGlslToHlsl(ps_full, moderngekko::GlslShaderKind::Fragment);
   if (!vs_hlsl || !ps_hlsl)
-    Fail("GLSL->SPIRV->HLSL translation failed");
+  {
+    std::fprintf(stderr, "GLSL->SPIRV->HLSL translation failed\n");
+    return false;
+  }
   *vs_hlsl_storage = *vs_hlsl;
   *ps_hlsl_storage = *ps_hlsl;
 
@@ -125,7 +125,7 @@ ComPtr<ID3DBlob> CompileFromCapturedState(std::string_view* out_vs_src, std::str
   {
     std::fprintf(stderr, "VS D3DCompile failed: %s\n",
                  errors ? static_cast<const char*>(errors->GetBufferPointer()) : "?");
-    Fail("vertex shader compile", hr);
+    return false;
   }
   hr = D3DCompile(ps_hlsl->data(), ps_hlsl->size(), nullptr, nullptr, nullptr, "main", "ps_5_0", 0,
                    0, &ps_blob, &errors);
@@ -133,12 +133,13 @@ ComPtr<ID3DBlob> CompileFromCapturedState(std::string_view* out_vs_src, std::str
   {
     std::fprintf(stderr, "PS D3DCompile failed: %s\n",
                  errors ? static_cast<const char*>(errors->GetBufferPointer()) : "?");
-    Fail("pixel shader compile", hr);
+    return false;
   }
   std::printf("VS bytecode=%zu bytes, PS bytecode=%zu bytes\n", vs_blob->GetBufferSize(),
               ps_blob->GetBufferSize());
+  *out_vs_blob = vs_blob;
   *out_ps_blob = ps_blob;
-  return vs_blob;
+  return true;
 }
 
 // Historical fallback shader pair, no longer used for the PSO/draw (see
@@ -202,20 +203,68 @@ int ComponentsForMask(BYTE mask)
 // plain-text dump by gx_vertex_dump.cpp. Loaded here instead of the
 // synthetic NDC triangle when the dump file is present, so this probe can
 // show real game geometry (not just a placeholder shape).
+// Phase 8: one merged draw's real captured state, so the render side can
+// compile and use THIS draw's own real shader instead of one shared
+// stand-in for everything (see StateRecord/LoadStates below).
+struct DrawRange
+{
+  std::uint32_t index_start = 0;
+  std::uint32_t index_count = 0;
+  int state_index = -1;
+};
+
 struct RealGeometry
 {
   std::vector<std::array<float, 3>> positions;  // raw GX vertex-space, not yet NDC
   std::vector<std::array<float, 4>> colors;      // RGBA, normalized 0..1, parallel to positions
   std::vector<std::uint32_t> indices;
+  std::vector<DrawRange> draws;
 };
 
-// Phase 3b: the dump format now holds several "=== draw N ===" blocks (see
-// gx_vertex_dump.cpp), each with its own locally-0-based index list. Merge
-// them into one combined vertex/index buffer, offsetting each draw's
-// indices by the running vertex count so far, so a single
-// DrawIndexedInstanced renders every captured draw's geometry together
-// (their relative positions preserved, since the caller normalizes the
-// WHOLE merged set to NDC via one shared bounding box, not per-draw).
+// Phase 8: GxVertexDumpDevice::WriteOrReuseState's real CP/XF/BP register
+// snapshot for one draw (deduplicated across draws sharing identical
+// state), loaded from "<vertex_path>.states" -- see gx_vertex_dump.cpp for
+// the exact fixed-size binary record layout (256/0x1058/256 u32, in that
+// order, no length prefix since every record is the same size).
+struct StateRecord
+{
+  std::array<std::uint32_t, 256> cp{};
+  std::array<std::uint32_t, 0x1058> xf{};
+  std::array<std::uint32_t, 256> bp{};
+};
+
+std::vector<StateRecord> LoadStates(const char* path)
+{
+  std::vector<StateRecord> states;
+  std::ifstream in(path, std::ios::binary);
+  if (!in)
+    return states;
+  constexpr std::size_t kRecordU32 = 256 + 0x1058 + 256;
+  while (true)
+  {
+    StateRecord rec;
+    in.read(reinterpret_cast<char*>(rec.cp.data()), rec.cp.size() * sizeof(std::uint32_t));
+    in.read(reinterpret_cast<char*>(rec.xf.data()), rec.xf.size() * sizeof(std::uint32_t));
+    in.read(reinterpret_cast<char*>(rec.bp.data()), rec.bp.size() * sizeof(std::uint32_t));
+    if (in.gcount() == 0 && in.eof())
+      break;
+    if (!in)
+      break;
+    states.push_back(rec);
+  }
+  (void)kRecordU32;
+  return states;
+}
+
+// Phase 3b/8: the dump format holds several "=== draw N ===" blocks (see
+// gx_vertex_dump.cpp), each with its own locally-0-based index list and
+// (Phase 8) a "state=<index>" line referencing LoadStates' records. Merge
+// all draws into one combined vertex/index buffer, offsetting each draw's
+// indices by the running vertex count so far, while keeping a per-draw
+// DrawRange (index sub-range + state index) so the render side can issue
+// one DrawIndexedInstanced per draw using THAT draw's own real shader
+// (relative positions are still preserved via one shared bounding box
+// computed by the caller across the WHOLE merged set, not per-draw).
 std::optional<RealGeometry> LoadRealGeometry(const char* path)
 {
   std::ifstream in(path);
@@ -231,6 +280,13 @@ std::optional<RealGeometry> LoadRealGeometry(const char* path)
     if (line.rfind("=== draw", 0) == 0)
     {
       draw_base_vertex = static_cast<std::uint32_t>(geo.positions.size());
+      geo.draws.push_back(DrawRange{static_cast<std::uint32_t>(geo.indices.size()), 0, -1});
+      continue;
+    }
+    if (line.rfind("state=", 0) == 0)
+    {
+      if (!geo.draws.empty())
+        geo.draws.back().state_index = std::stoi(line.substr(6));
       continue;
     }
     std::istringstream iss(line);
@@ -278,6 +334,18 @@ std::optional<RealGeometry> LoadRealGeometry(const char* path)
   }
   if (geo.positions.empty() || geo.indices.empty())
     return std::nullopt;
+
+  // Finalize each DrawRange's index_count now that every draw's "i" lines
+  // have been read: each range spans from its own index_start up to the
+  // NEXT draw's index_start (or the end of the merged index buffer for the
+  // last one).
+  for (std::size_t i = 0; i < geo.draws.size(); ++i)
+  {
+    const std::uint32_t range_end = (i + 1 < geo.draws.size())
+                                        ? geo.draws[i + 1].index_start
+                                        : static_cast<std::uint32_t>(geo.indices.size());
+    geo.draws[i].index_count = range_end - geo.draws[i].index_start;
+  }
   return geo;
 }
 
@@ -463,40 +531,54 @@ void FillIdentityAndOnes(std::vector<std::uint8_t>* buf,
       std::memcpy(buf->data() + offset + chunk * 16, kIdentityRows[chunk % 4], 16);
   }
 }
-}  // namespace
 
-int RealMain()
+// Phase 8: everything needed to issue draw calls with ONE draw's own real
+// captured shader -- root signature, PSO, and the descriptor heaps/
+// cbuffers/textures its resources were bound into. Built once per unique
+// captured state (see BuildRenderableState) and reused for every draw that
+// shares that exact state.
+struct RenderableState
 {
-  moderngekko::DolphinShaderCompiler::SetCacheDirectory("native-render-window-cache");
+  ComPtr<ID3D12RootSignature> root_sig;
+  ComPtr<ID3D12PipelineState> pso;
+  ComPtr<ID3D12DescriptorHeap> cbv_srv_heap, sampler_heap;
+  UINT cbv_srv_stride = 0, sampler_stride = 0;
+  UINT total_samplers = 0;
+  std::size_t vs_cbuf_count = 0, vs_tex_count = 0, ps_cbuf_count = 0, ps_tex_count = 0;
+  std::vector<int> input_components;
+  UINT vertex_stride = 0;
+  std::vector<ComPtr<ID3D12Resource>> keep_alive;
+};
 
-  // Drive the actual PSO/draw with the real BT3-captured shader (the whole
-  // point of this probe). See the xf[0x103fu] comment in
-  // CompileFromCapturedState for the fix that made the VS/PS interface
-  // agree; kSyntheticVs/kSyntheticPs below are kept only as a documented
-  // fallback reference, no longer used.
+// Compiles this state's own real shader (CompileShaderForState), reflects
+// it, and builds a complete, independent root signature/PSO/descriptor-
+// heap/cbuffer/texture set for it -- the same steps Phase 1c-7c did once
+// for one shared fixed state, now repeated per real captured state so each
+// draw can use its OWN real shader instead of a stand-in. Returns nullopt
+// (logging why) on any failure -- some captured states may not have valid
+// enough register data to shader-gen/compile/link, and skipping just that
+// state's draws is far better than aborting the whole probe over it.
+// Texture upload commands are recorded onto setup_cl (not yet executed);
+// keep_alive_staging must outlive that execution, same lifetime rule as
+// the original single-state code's staging_buffers vector.
+std::optional<RenderableState> BuildRenderableState(
+    ID3D12Device* device, ID3D12InfoQueue* info_queue, std::span<const std::uint32_t> cp,
+    std::span<const std::uint32_t> xf, std::span<const std::uint32_t> bp, const RealTexture* real_tex,
+    UINT tex_w, UINT tex_h, ID3D12GraphicsCommandList* setup_cl,
+    std::vector<ComPtr<ID3D12Resource>>* keep_alive_staging)
+{
   std::string vs_hlsl, ps_hlsl;
-  std::string_view vs_src, ps_src;
-  ComPtr<ID3DBlob> ps_blob;
-  ComPtr<ID3DBlob> vs_blob =
-      CompileFromCapturedState(&vs_src, &ps_src, &vs_hlsl, &ps_hlsl, &ps_blob);
-  std::printf("Real captured-state VS bytecode=%zu bytes, PS bytecode=%zu bytes (used for PSO/draw)\n",
-              vs_blob->GetBufferSize(), ps_blob->GetBufferSize());
-  {
-    std::ofstream vf("real_vs_debug.hlsl");
-    vf << vs_hlsl;
-    std::ofstream pf("real_ps_debug.hlsl");
-    pf << ps_hlsl;
-  }
+  ComPtr<ID3DBlob> vs_blob, ps_blob;
+  if (!CompileShaderForState(cp, xf, bp, &vs_hlsl, &ps_hlsl, &vs_blob, &ps_blob))
+    return std::nullopt;
 
-  // --- reflect bytecode to build input layout + root signature ---
   ComPtr<ID3D12ShaderReflection> vs_refl, ps_refl;
-  HRESULT hr = D3DReflect(vs_blob->GetBufferPointer(), vs_blob->GetBufferSize(),
-                           IID_PPV_ARGS(&vs_refl));
-  if (FAILED(hr))
-    Fail("D3DReflect(vs)", hr);
-  hr = D3DReflect(ps_blob->GetBufferPointer(), ps_blob->GetBufferSize(), IID_PPV_ARGS(&ps_refl));
-  if (FAILED(hr))
-    Fail("D3DReflect(ps)", hr);
+  if (FAILED(
+          D3DReflect(vs_blob->GetBufferPointer(), vs_blob->GetBufferSize(), IID_PPV_ARGS(&vs_refl))))
+    return std::nullopt;
+  if (FAILED(
+          D3DReflect(ps_blob->GetBufferPointer(), ps_blob->GetBufferSize(), IID_PPV_ARGS(&ps_refl))))
+    return std::nullopt;
 
   D3D12_SHADER_DESC vs_desc{};
   vs_refl->GetDesc(&vs_desc);
@@ -512,7 +594,7 @@ int RealMain()
     semantic_storage.emplace_back(p.SemanticName);
     vs_stage.input_components.push_back(ComponentsForMask(static_cast<BYTE>(p.Mask)));
     D3D12_INPUT_ELEMENT_DESC elem{};
-    elem.SemanticName = nullptr;  // patched below once storage is stable
+    elem.SemanticName = nullptr;
     elem.SemanticIndex = p.SemanticIndex;
     elem.Format = FormatForMask(static_cast<BYTE>(p.Mask));
     elem.InputSlot = 0;
@@ -523,19 +605,344 @@ int RealMain()
   }
   for (std::size_t i = 0; i < vs_stage.input_layout.size(); ++i)
     vs_stage.input_layout[i].SemanticName = semantic_storage[i].c_str();
-  vs_stage.input_semantics = semantic_storage;
   const UINT vertex_stride = running_offset;
-  for (std::size_t i = 0; i < semantic_storage.size(); ++i)
-    std::printf("VS input attr %zu: semantic=%s components=%d\n", i, semantic_storage[i].c_str(),
-                vs_stage.input_components[i]);
 
   ReflectResources(vs_refl.Get(), &vs_stage);
   ReflectResources(ps_refl.Get(), &ps_stage);
-  std::printf("VS: %zu input attrs (stride=%u), %zu cbuf, %zu tex, %zu samp\n",
-              vs_stage.input_layout.size(), vertex_stride, vs_stage.cbuffers.size(),
-              vs_stage.textures.size(), vs_stage.samplers.size());
-  std::printf("PS: %zu cbuf, %zu tex, %zu samp\n", ps_stage.cbuffers.size(), ps_stage.textures.size(),
-              ps_stage.samplers.size());
+
+  RenderableState rs;
+  rs.input_components = vs_stage.input_components;
+  rs.vertex_stride = vertex_stride;
+  rs.vs_cbuf_count = vs_stage.cbuffers.size();
+  rs.vs_tex_count = vs_stage.textures.size();
+  rs.ps_cbuf_count = ps_stage.cbuffers.size();
+  rs.ps_tex_count = ps_stage.textures.size();
+
+  const UINT cbv_srv_count = static_cast<UINT>(vs_stage.cbuffers.size() + ps_stage.cbuffers.size() +
+                                               vs_stage.textures.size() + ps_stage.textures.size());
+  const UINT sampler_count =
+      static_cast<UINT>(vs_stage.samplers.size() + ps_stage.samplers.size());
+  if (cbv_srv_count > 0)
+  {
+    D3D12_DESCRIPTOR_HEAP_DESC d{};
+    d.NumDescriptors = cbv_srv_count;
+    d.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+    d.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+    device->CreateDescriptorHeap(&d, IID_PPV_ARGS(&rs.cbv_srv_heap));
+  }
+  if (sampler_count > 0)
+  {
+    D3D12_DESCRIPTOR_HEAP_DESC d{};
+    d.NumDescriptors = sampler_count;
+    d.Type = D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER;
+    d.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+    device->CreateDescriptorHeap(&d, IID_PPV_ARGS(&rs.sampler_heap));
+  }
+  rs.cbv_srv_stride = cbv_srv_count
+                          ? device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV)
+                          : 0;
+  rs.sampler_stride =
+      sampler_count ? device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER) : 0;
+  rs.total_samplers = sampler_count;
+
+  std::vector<D3D12_DESCRIPTOR_RANGE1> ranges;
+  std::vector<D3D12_ROOT_PARAMETER1> root_params;
+  auto add_table = [&](D3D12_DESCRIPTOR_RANGE_TYPE type, UINT base_register, UINT count) {
+    if (count == 0)
+      return;
+    D3D12_DESCRIPTOR_RANGE1 range{};
+    range.RangeType = type;
+    range.NumDescriptors = count;
+    range.BaseShaderRegister = base_register;
+    range.RegisterSpace = 0;
+    range.Flags = D3D12_DESCRIPTOR_RANGE_FLAG_NONE;
+    range.OffsetInDescriptorsFromTableStart = D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
+    ranges.push_back(range);
+  };
+  auto min_bind = [](const std::vector<ReflectedResource>& v) {
+    UINT m = 0;
+    for (std::size_t i = 0; i < v.size(); ++i)
+      m = (i == 0) ? v[i].bind_point : (v[i].bind_point < m ? v[i].bind_point : m);
+    return m;
+  };
+  add_table(D3D12_DESCRIPTOR_RANGE_TYPE_CBV, min_bind(vs_stage.cbuffers),
+            static_cast<UINT>(vs_stage.cbuffers.size()));
+  add_table(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, min_bind(vs_stage.textures),
+            static_cast<UINT>(vs_stage.textures.size()));
+  add_table(D3D12_DESCRIPTOR_RANGE_TYPE_CBV, min_bind(ps_stage.cbuffers),
+            static_cast<UINT>(ps_stage.cbuffers.size()));
+  add_table(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, min_bind(ps_stage.textures),
+            static_cast<UINT>(ps_stage.textures.size()));
+  int range_idx = 0;
+  auto make_param = [&](D3D12_SHADER_VISIBILITY vis) {
+    D3D12_ROOT_PARAMETER1 param{};
+    param.ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    param.DescriptorTable.NumDescriptorRanges = 1;
+    param.DescriptorTable.pDescriptorRanges = &ranges[range_idx++];
+    param.ShaderVisibility = vis;
+    return param;
+  };
+  if (!vs_stage.cbuffers.empty())
+    root_params.push_back(make_param(D3D12_SHADER_VISIBILITY_VERTEX));
+  if (!vs_stage.textures.empty())
+    root_params.push_back(make_param(D3D12_SHADER_VISIBILITY_VERTEX));
+  if (!ps_stage.cbuffers.empty())
+    root_params.push_back(make_param(D3D12_SHADER_VISIBILITY_PIXEL));
+  if (!ps_stage.textures.empty())
+    root_params.push_back(make_param(D3D12_SHADER_VISIBILITY_PIXEL));
+
+  D3D12_ROOT_PARAMETER1 sampler_param{};
+  D3D12_DESCRIPTOR_RANGE1 sampler_range{};
+  if (sampler_count > 0)
+  {
+    sampler_range.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER;
+    sampler_range.NumDescriptors = sampler_count;
+    sampler_range.BaseShaderRegister = 0;
+    sampler_range.OffsetInDescriptorsFromTableStart = 0;
+    sampler_param.ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    sampler_param.DescriptorTable.NumDescriptorRanges = 1;
+    sampler_param.DescriptorTable.pDescriptorRanges = &sampler_range;
+    sampler_param.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+    root_params.push_back(sampler_param);
+  }
+
+  D3D12_VERSIONED_ROOT_SIGNATURE_DESC rsdesc{};
+  rsdesc.Version = D3D_ROOT_SIGNATURE_VERSION_1_1;
+  rsdesc.Desc_1_1.NumParameters = static_cast<UINT>(root_params.size());
+  rsdesc.Desc_1_1.pParameters = root_params.empty() ? nullptr : root_params.data();
+  rsdesc.Desc_1_1.Flags = D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
+  ComPtr<ID3DBlob> rs_blob, rs_err;
+  if (FAILED(D3D12SerializeVersionedRootSignature(&rsdesc, &rs_blob, &rs_err)))
+  {
+    std::fprintf(stderr, "root sig serialize failed: %s\n",
+                 rs_err ? static_cast<const char*>(rs_err->GetBufferPointer()) : "?");
+    return std::nullopt;
+  }
+  if (FAILED(device->CreateRootSignature(0, rs_blob->GetBufferPointer(), rs_blob->GetBufferSize(),
+                                         IID_PPV_ARGS(&rs.root_sig))))
+    return std::nullopt;
+
+  D3D12_GRAPHICS_PIPELINE_STATE_DESC pso_desc{};
+  pso_desc.pRootSignature = rs.root_sig.Get();
+  pso_desc.VS = {vs_blob->GetBufferPointer(), vs_blob->GetBufferSize()};
+  pso_desc.PS = {ps_blob->GetBufferPointer(), ps_blob->GetBufferSize()};
+  pso_desc.InputLayout = {vs_stage.input_layout.empty() ? nullptr : vs_stage.input_layout.data(),
+                          static_cast<UINT>(vs_stage.input_layout.size())};
+  pso_desc.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+  pso_desc.NumRenderTargets = 1;
+  pso_desc.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+  pso_desc.SampleDesc.Count = 1;
+  pso_desc.SampleMask = UINT_MAX;
+  D3D12_RASTERIZER_DESC raster{};
+  raster.FillMode = D3D12_FILL_MODE_SOLID;
+  raster.CullMode = D3D12_CULL_MODE_NONE;
+  raster.DepthClipEnable = TRUE;
+  pso_desc.RasterizerState = raster;
+  D3D12_BLEND_DESC blend{};
+  blend.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+  blend.RenderTarget[0].SrcBlend = D3D12_BLEND_ONE;
+  blend.RenderTarget[0].DestBlend = D3D12_BLEND_ZERO;
+  blend.RenderTarget[0].BlendOp = D3D12_BLEND_OP_ADD;
+  blend.RenderTarget[0].SrcBlendAlpha = D3D12_BLEND_ONE;
+  blend.RenderTarget[0].DestBlendAlpha = D3D12_BLEND_ZERO;
+  blend.RenderTarget[0].BlendOpAlpha = D3D12_BLEND_OP_ADD;
+  blend.RenderTarget[0].LogicOp = D3D12_LOGIC_OP_NOOP;
+  pso_desc.BlendState = blend;
+  D3D12_DEPTH_STENCIL_DESC depth{};
+  depth.DepthEnable = FALSE;
+  depth.StencilEnable = FALSE;
+  pso_desc.DepthStencilState = depth;
+
+  const HRESULT pso_hr = device->CreateGraphicsPipelineState(&pso_desc, IID_PPV_ARGS(&rs.pso));
+  if (FAILED(pso_hr))
+  {
+    if (info_queue)
+    {
+      const UINT64 n = info_queue->GetNumStoredMessages();
+      for (UINT64 i = 0; i < n; ++i)
+      {
+        SIZE_T len = 0;
+        info_queue->GetMessage(i, nullptr, &len);
+        std::vector<char> buf(len);
+        auto* m = reinterpret_cast<D3D12_MESSAGE*>(buf.data());
+        info_queue->GetMessage(i, m, &len);
+        std::fprintf(stderr, "D3D12 debug layer: %s\n", m->pDescription);
+      }
+    }
+    std::fprintf(stderr, "CreateGraphicsPipelineState failed (hr=0x%08lx)\n",
+                 static_cast<unsigned long>(pso_hr));
+    return std::nullopt;
+  }
+
+  auto make_cbv_buffer = [&](UINT size) {
+    const UINT aligned = (size + 255) & ~255u;
+    ComPtr<ID3D12Resource> res;
+    D3D12_HEAP_PROPERTIES heap{D3D12_HEAP_TYPE_UPLOAD};
+    D3D12_RESOURCE_DESC rdesc{};
+    rdesc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    rdesc.Width = aligned;
+    rdesc.Height = 1;
+    rdesc.DepthOrArraySize = 1;
+    rdesc.MipLevels = 1;
+    rdesc.SampleDesc.Count = 1;
+    rdesc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &rdesc,
+                                    D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&res));
+    return std::make_pair(res, aligned);
+  };
+  D3D12_CPU_DESCRIPTOR_HANDLE cbv_srv_cursor{};
+  if (rs.cbv_srv_heap)
+    cbv_srv_cursor = rs.cbv_srv_heap->GetCPUDescriptorHandleForHeapStart();
+  auto write_cbuffers = [&](StageReflection& stage) {
+    for (std::size_t i = 0; i < stage.cbuffers.size(); ++i)
+    {
+      auto [res, aligned] = make_cbv_buffer(stage.cbuffer_sizes[i]);
+      std::vector<std::uint8_t> data(aligned, 0);
+      FillIdentityAndOnes(&data, stage.cbuffer_mat4_offsets[i]);
+      void* mapped = nullptr;
+      res->Map(0, nullptr, &mapped);
+      std::memcpy(mapped, data.data(), aligned);
+      res->Unmap(0, nullptr);
+      D3D12_CONSTANT_BUFFER_VIEW_DESC cbvdesc{};
+      cbvdesc.BufferLocation = res->GetGPUVirtualAddress();
+      cbvdesc.SizeInBytes = aligned;
+      device->CreateConstantBufferView(&cbvdesc, cbv_srv_cursor);
+      cbv_srv_cursor.ptr += rs.cbv_srv_stride;
+      rs.keep_alive.push_back(res);
+    }
+  };
+  write_cbuffers(vs_stage);
+
+  auto write_textures = [&](StageReflection& stage) {
+    for (std::size_t i = 0; i < stage.textures.size(); ++i)
+    {
+      D3D12_HEAP_PROPERTIES heap{D3D12_HEAP_TYPE_DEFAULT};
+      D3D12_RESOURCE_DESC rdesc{};
+      rdesc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+      rdesc.Width = tex_w;
+      rdesc.Height = tex_h;
+      rdesc.DepthOrArraySize = 1;
+      rdesc.MipLevels = 1;
+      rdesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+      rdesc.SampleDesc.Count = 1;
+      ComPtr<ID3D12Resource> tex;
+      device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &rdesc,
+                                      D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&tex));
+      D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
+      srv.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+      srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+      srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+      srv.Texture2D.MipLevels = 1;
+      device->CreateShaderResourceView(tex.Get(), &srv, cbv_srv_cursor);
+      cbv_srv_cursor.ptr += rs.cbv_srv_stride;
+
+      const UINT row_pitch = (tex_w * 4u + 255u) & ~255u;
+      ComPtr<ID3D12Resource> staging;
+      D3D12_HEAP_PROPERTIES sheap{D3D12_HEAP_TYPE_UPLOAD};
+      D3D12_RESOURCE_DESC srdesc{};
+      srdesc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+      srdesc.Width = static_cast<UINT64>(row_pitch) * tex_h;
+      srdesc.Height = 1;
+      srdesc.DepthOrArraySize = 1;
+      srdesc.MipLevels = 1;
+      srdesc.SampleDesc.Count = 1;
+      srdesc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+      device->CreateCommittedResource(&sheap, D3D12_HEAP_FLAG_NONE, &srdesc,
+                                      D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
+                                      IID_PPV_ARGS(&staging));
+      std::vector<std::uint8_t> pixels(static_cast<std::size_t>(row_pitch) * tex_h, 0);
+      for (UINT y = 0; y < tex_h; ++y)
+      {
+        for (UINT x = 0; x < tex_w; ++x)
+        {
+          std::uint8_t* px = &pixels[y * row_pitch + x * 4];
+          if (real_tex)
+          {
+            const std::uint8_t* src = &real_tex->rgba8[(y * tex_w + x) * 4];
+            px[0] = src[0];
+            px[1] = src[1];
+            px[2] = src[2];
+            px[3] = src[3];
+          }
+          else
+          {
+            const bool right = x >= tex_w / 2;
+            const bool bottom = y >= tex_h / 2;
+            if (!right && !bottom)
+            {
+              px[0] = 220; px[1] = 40; px[2] = 40;
+            }
+            else if (right && !bottom)
+            {
+              px[0] = 40; px[1] = 220; px[2] = 40;
+            }
+            else if (!right && bottom)
+            {
+              px[0] = 40; px[1] = 40; px[2] = 220;
+            }
+            else
+            {
+              px[0] = 220; px[1] = 220; px[2] = 40;
+            }
+            px[3] = 255;
+          }
+        }
+      }
+      void* mapped = nullptr;
+      staging->Map(0, nullptr, &mapped);
+      std::memcpy(mapped, pixels.data(), pixels.size());
+      staging->Unmap(0, nullptr);
+
+      D3D12_TEXTURE_COPY_LOCATION dst{};
+      dst.pResource = tex.Get();
+      dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+      dst.SubresourceIndex = 0;
+      D3D12_TEXTURE_COPY_LOCATION src{};
+      src.pResource = staging.Get();
+      src.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+      src.PlacedFootprint.Footprint.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+      src.PlacedFootprint.Footprint.Width = tex_w;
+      src.PlacedFootprint.Footprint.Height = tex_h;
+      src.PlacedFootprint.Footprint.Depth = 1;
+      src.PlacedFootprint.Footprint.RowPitch = row_pitch;
+      setup_cl->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+
+      D3D12_RESOURCE_BARRIER barrier{};
+      barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+      barrier.Transition.pResource = tex.Get();
+      barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+      barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+      setup_cl->ResourceBarrier(1, &barrier);
+
+      rs.keep_alive.push_back(tex);
+      keep_alive_staging->push_back(staging);
+    }
+  };
+  write_textures(vs_stage);
+  write_cbuffers(ps_stage);
+  write_textures(ps_stage);
+
+  if (rs.sampler_heap)
+  {
+    D3D12_CPU_DESCRIPTOR_HANDLE sampler_cursor = rs.sampler_heap->GetCPUDescriptorHandleForHeapStart();
+    D3D12_SAMPLER_DESC sdesc{};
+    sdesc.Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
+    sdesc.AddressU = sdesc.AddressV = sdesc.AddressW = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
+    for (UINT i = 0; i < rs.total_samplers; ++i)
+    {
+      device->CreateSampler(&sdesc, sampler_cursor);
+      sampler_cursor.ptr += rs.sampler_stride;
+    }
+  }
+
+  return rs;
+}
+}  // namespace
+
+int RealMain()
+{
+  moderngekko::DolphinShaderCompiler::SetCacheDirectory("native-render-window-cache");
+  HRESULT hr = S_OK;
 
   // --- window ---
   const wchar_t* kClassName = L"ModernGekkoNativeRenderWindow";
@@ -613,186 +1020,97 @@ int RealMain()
     device->CreateRenderTargetView(backbuffers[i].Get(), nullptr, h);
   }
 
-  // --- CBV/SRV/UAV + sampler heaps for both stages' reflected resources ---
-  const UINT cbv_srv_count = static_cast<UINT>(vs_stage.cbuffers.size() + ps_stage.cbuffers.size() +
-                                               vs_stage.textures.size() + ps_stage.textures.size());
-  const UINT sampler_count =
-      static_cast<UINT>(vs_stage.samplers.size() + ps_stage.samplers.size());
-  ComPtr<ID3D12DescriptorHeap> cbv_srv_heap, sampler_heap;
-  if (cbv_srv_count > 0)
-  {
-    D3D12_DESCRIPTOR_HEAP_DESC d{};
-    d.NumDescriptors = cbv_srv_count;
-    d.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
-    d.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
-    device->CreateDescriptorHeap(&d, IID_PPV_ARGS(&cbv_srv_heap));
-  }
-  if (sampler_count > 0)
-  {
-    D3D12_DESCRIPTOR_HEAP_DESC d{};
-    d.NumDescriptors = sampler_count;
-    d.Type = D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER;
-    d.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
-    device->CreateDescriptorHeap(&d, IID_PPV_ARGS(&sampler_heap));
-  }
-  const UINT cbv_srv_stride =
-      cbv_srv_count ? device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV)
-                    : 0;
-  const UINT sampler_stride =
-      sampler_count ? device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER) : 0;
-
-  // --- root signature: one table per (stage,resource-kind) that's non-empty ---
-  std::vector<D3D12_DESCRIPTOR_RANGE1> ranges;
-  std::vector<D3D12_ROOT_PARAMETER1> root_params;
-  auto add_table = [&](D3D12_DESCRIPTOR_RANGE_TYPE type, UINT base_register, UINT count,
-                       D3D12_SHADER_VISIBILITY vis) {
-    if (count == 0)
-      return;
-    D3D12_DESCRIPTOR_RANGE1 range{};
-    range.RangeType = type;
-    range.NumDescriptors = count;
-    range.BaseShaderRegister = base_register;
-    range.RegisterSpace = 0;
-    range.Flags = D3D12_DESCRIPTOR_RANGE_FLAG_NONE;
-    range.OffsetInDescriptorsFromTableStart = D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
-    ranges.push_back(range);
-  };
-  auto min_bind = [](const std::vector<ReflectedResource>& v) {
-    UINT m = 0;
-    for (std::size_t i = 0; i < v.size(); ++i)
-      m = (i == 0) ? v[i].bind_point : (v[i].bind_point < m ? v[i].bind_point : m);
-    return m;
-  };
-  add_table(D3D12_DESCRIPTOR_RANGE_TYPE_CBV, min_bind(vs_stage.cbuffers),
-            static_cast<UINT>(vs_stage.cbuffers.size()), D3D12_SHADER_VISIBILITY_VERTEX);
-  add_table(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, min_bind(vs_stage.textures),
-            static_cast<UINT>(vs_stage.textures.size()), D3D12_SHADER_VISIBILITY_VERTEX);
-  add_table(D3D12_DESCRIPTOR_RANGE_TYPE_CBV, min_bind(ps_stage.cbuffers),
-            static_cast<UINT>(ps_stage.cbuffers.size()), D3D12_SHADER_VISIBILITY_PIXEL);
-  add_table(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, min_bind(ps_stage.textures),
-            static_cast<UINT>(ps_stage.textures.size()), D3D12_SHADER_VISIBILITY_PIXEL);
-  // one range each keeps every table trivially valid regardless of which stage owns it
-  int range_idx = 0;
-  auto make_param = [&](D3D12_SHADER_VISIBILITY vis) {
-    D3D12_ROOT_PARAMETER1 param{};
-    param.ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
-    param.DescriptorTable.NumDescriptorRanges = 1;
-    param.DescriptorTable.pDescriptorRanges = &ranges[range_idx++];
-    param.ShaderVisibility = vis;
-    return param;
-  };
-  if (!vs_stage.cbuffers.empty())
-    root_params.push_back(make_param(D3D12_SHADER_VISIBILITY_VERTEX));
-  if (!vs_stage.textures.empty())
-    root_params.push_back(make_param(D3D12_SHADER_VISIBILITY_VERTEX));
-  if (!ps_stage.cbuffers.empty())
-    root_params.push_back(make_param(D3D12_SHADER_VISIBILITY_PIXEL));
-  if (!ps_stage.textures.empty())
-    root_params.push_back(make_param(D3D12_SHADER_VISIBILITY_PIXEL));
-
-  D3D12_ROOT_PARAMETER1 sampler_param{};
-  const UINT total_samplers = static_cast<UINT>(vs_stage.samplers.size() + ps_stage.samplers.size());
-  D3D12_DESCRIPTOR_RANGE1 sampler_range{};
-  if (total_samplers > 0)
-  {
-    sampler_range.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER;
-    sampler_range.NumDescriptors = total_samplers;
-    sampler_range.BaseShaderRegister = 0;
-    sampler_range.OffsetInDescriptorsFromTableStart = 0;
-    sampler_param.ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
-    sampler_param.DescriptorTable.NumDescriptorRanges = 1;
-    sampler_param.DescriptorTable.pDescriptorRanges = &sampler_range;
-    sampler_param.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
-    root_params.push_back(sampler_param);
-  }
-
-  D3D12_VERSIONED_ROOT_SIGNATURE_DESC rsdesc{};
-  rsdesc.Version = D3D_ROOT_SIGNATURE_VERSION_1_1;
-  rsdesc.Desc_1_1.NumParameters = static_cast<UINT>(root_params.size());
-  rsdesc.Desc_1_1.pParameters = root_params.empty() ? nullptr : root_params.data();
-  rsdesc.Desc_1_1.Flags = D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
-  ComPtr<ID3DBlob> rs_blob, rs_err;
-  hr = D3D12SerializeVersionedRootSignature(&rsdesc, &rs_blob, &rs_err);
-  if (FAILED(hr))
-  {
-    std::fprintf(stderr, "root sig serialize failed: %s\n",
-                 rs_err ? static_cast<const char*>(rs_err->GetBufferPointer()) : "?");
-    Fail("D3D12SerializeVersionedRootSignature", hr);
-  }
-  ComPtr<ID3D12RootSignature> root_sig;
-  hr = device->CreateRootSignature(0, rs_blob->GetBufferPointer(), rs_blob->GetBufferSize(),
-                                   IID_PPV_ARGS(&root_sig));
-  if (FAILED(hr))
-    Fail("CreateRootSignature", hr);
-
-  // --- PSO (real BT3-captured-state vs_blob/ps_blob + reflected input layout) ---
-  D3D12_GRAPHICS_PIPELINE_STATE_DESC pso_desc{};
-  pso_desc.pRootSignature = root_sig.Get();
-  pso_desc.VS = {vs_blob->GetBufferPointer(), vs_blob->GetBufferSize()};
-  pso_desc.PS = {ps_blob->GetBufferPointer(), ps_blob->GetBufferSize()};
-  pso_desc.InputLayout = {vs_stage.input_layout.empty() ? nullptr : vs_stage.input_layout.data(),
-                          static_cast<UINT>(vs_stage.input_layout.size())};
-  pso_desc.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
-  pso_desc.NumRenderTargets = 1;
-  pso_desc.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
-  pso_desc.SampleDesc.Count = 1;
-  pso_desc.SampleMask = UINT_MAX;
-  D3D12_RASTERIZER_DESC raster{};
-  raster.FillMode = D3D12_FILL_MODE_SOLID;
-  raster.CullMode = D3D12_CULL_MODE_NONE;
-  raster.DepthClipEnable = TRUE;
-  pso_desc.RasterizerState = raster;
-  D3D12_BLEND_DESC blend{};
-  blend.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
-  blend.RenderTarget[0].SrcBlend = D3D12_BLEND_ONE;
-  blend.RenderTarget[0].DestBlend = D3D12_BLEND_ZERO;
-  blend.RenderTarget[0].BlendOp = D3D12_BLEND_OP_ADD;
-  blend.RenderTarget[0].SrcBlendAlpha = D3D12_BLEND_ONE;
-  blend.RenderTarget[0].DestBlendAlpha = D3D12_BLEND_ZERO;
-  blend.RenderTarget[0].BlendOpAlpha = D3D12_BLEND_OP_ADD;
-  blend.RenderTarget[0].LogicOp = D3D12_LOGIC_OP_NOOP;
-  pso_desc.BlendState = blend;
-  D3D12_DEPTH_STENCIL_DESC depth{};
-  depth.DepthEnable = FALSE;
-  depth.StencilEnable = FALSE;
-  pso_desc.DepthStencilState = depth;
-
-  ComPtr<ID3D12PipelineState> pso;
-  hr = device->CreateGraphicsPipelineState(&pso_desc, IID_PPV_ARGS(&pso));
-  if (FAILED(hr))
-  {
-    if (info_queue)
-    {
-      const UINT64 n = info_queue->GetNumStoredMessages();
-      for (UINT64 i = 0; i < n; ++i)
-      {
-        SIZE_T len = 0;
-        info_queue->GetMessage(i, nullptr, &len);
-        std::vector<char> buf(len);
-        auto* m = reinterpret_cast<D3D12_MESSAGE*>(buf.data());
-        info_queue->GetMessage(i, m, &len);
-        std::fprintf(stderr, "D3D12 debug layer: %s\n", m->pDescription);
-      }
-    }
-    Fail("CreateGraphicsPipelineState", hr);
-  }
-  std::printf("PSO created OK.\n");
-
-  // --- vertex buffer: real decoded BT3 geometry if a dump is available
-  // (MODERNGEKKO_GX_VERTEX_DUMP capture, see gx_vertex_dump.cpp), else the
-  // synthetic NDC triangle fallback. The real captured-state VS has multiple
-  // input attributes (e.g. rawpos/rawcolor0/rawcolor1), not just a single
-  // POSITION float3 like the old synthetic shader, so fill generically from
-  // the reflected layout: first attribute gets the real/NDC position (padded
-  // with 1.0f to its component count), every other attribute is filled with
-  // 1.0f per component (same convention as the cbuffer fill above).
+  // --- Phase 8: load real geometry + per-draw captured state, build one
+  // real shader/PSO/resource set per unique state actually used (instead
+  // of one shared fixed stand-in -- see BuildRenderableState) ---
   const char* dump_path = std::getenv("MODERNGEKKO_REAL_GEOMETRY_DUMP");
   const std::optional<RealGeometry> real_geo =
       LoadRealGeometry(dump_path ? dump_path : "gx_vertex_dump.txt");
+  const std::string states_path =
+      std::string(dump_path ? dump_path : "gx_vertex_dump.txt") + ".states";
+  const std::vector<StateRecord> states = LoadStates(states_path.c_str());
+  std::printf("loaded %zu unique captured state(s) from %s\n", states.size(), states_path.c_str());
+
+  const char* real_tex_path_env = std::getenv("MODERNGEKKO_REAL_TEXTURE_DUMP");
+  const std::string real_tex_path =
+      real_tex_path_env ? real_tex_path_env
+                        : std::string(dump_path ? dump_path : "gx_vertex_dump.txt") + ".tex";
+  const std::optional<RealTexture> real_tex = LoadRealTexture(real_tex_path.c_str());
+  const UINT tex_w = real_tex ? real_tex->width : 8u;
+  const UINT tex_h = real_tex ? real_tex->height : 8u;
+  if (real_tex)
+    std::printf("using REAL decoded texture: %ux%u (from %s)\n", tex_w, tex_h, real_tex_path.c_str());
+  else
+    std::printf("no real texture dump found/decodable at %s, using synthetic quadrant texture\n",
+               real_tex_path.c_str());
+
+  // One shared upload command list: every RenderableState built below
+  // records its own texture copy onto this same list; executed once, after
+  // the loop, same fence-wait pattern as the original single-state code.
+  ComPtr<ID3D12CommandAllocator> setup_alloc;
+  device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&setup_alloc));
+  ComPtr<ID3D12GraphicsCommandList> setup_cl;
+  device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, setup_alloc.Get(), nullptr,
+                            IID_PPV_ARGS(&setup_cl));
+  std::vector<ComPtr<ID3D12Resource>> staging_buffers;
+
+  std::vector<RenderableState> renderables;
+  std::unordered_map<int, std::size_t> renderable_by_state;  // state_index -> renderables[] slot
+  constexpr int kMaxStates = 12;
+
+  if (real_geo && !states.empty())
+  {
+    // Rank unique states by how much geometry they cover (sum of
+    // index_count across draws using them), so the limited PSO budget goes
+    // to states that actually matter for what ends up visible.
+    std::unordered_map<int, std::uint32_t> coverage;
+    for (const auto& d : real_geo->draws)
+      if (d.state_index >= 0 && d.state_index < static_cast<int>(states.size()))
+        coverage[d.state_index] += d.index_count;
+    std::vector<std::pair<int, std::uint32_t>> ranked(coverage.begin(), coverage.end());
+    std::sort(ranked.begin(), ranked.end(),
+             [](const auto& a, const auto& b) { return a.second > b.second; });
+
+    std::optional<std::vector<int>> reference_layout;
+    for (const auto& [state_index, cov] : ranked)
+    {
+      if (static_cast<int>(renderables.size()) >= kMaxStates)
+        break;
+      const StateRecord& rec = states[static_cast<std::size_t>(state_index)];
+      std::optional<RenderableState> built = BuildRenderableState(
+          device.Get(), info_queue.Get(), rec.cp, rec.xf, rec.bp, real_tex ? &*real_tex : nullptr,
+          tex_w, tex_h, setup_cl.Get(), &staging_buffers);
+      if (!built)
+      {
+        std::fprintf(stderr,
+                     "state %d: failed to build a real shader/PSO, skipping its draws (%u index covered)\n",
+                     state_index, cov);
+        continue;
+      }
+      // Every draw shares ONE vertex buffer, so every renderable we keep
+      // must agree on the same vertex layout as the first one we build --
+      // a state whose real shader wants a structurally different vertex
+      // format can't be mixed in without its own buffer, which this probe
+      // doesn't build (see the class comment on RenderableState).
+      if (!reference_layout)
+        reference_layout = built->input_components;
+      else if (*reference_layout != built->input_components)
+      {
+        std::fprintf(stderr,
+                     "state %d: vertex input layout differs from the reference state, skipping its draws\n",
+                     state_index);
+        continue;
+      }
+      renderable_by_state[state_index] = renderables.size();
+      std::printf("state %d: built real shader/PSO (%u index covered)\n", state_index, cov);
+      renderables.push_back(std::move(*built));
+    }
+  }
 
   std::vector<std::array<float, 3>> ndc_positions;
   std::vector<std::uint32_t> draw_indices;
-  if (real_geo)
+  std::vector<DrawRange> draw_ranges;
+  if (real_geo && !renderables.empty())
   {
     // Raw GX vertex-space coordinates (e.g. 0..128, 0..224 for a UI/HUD
     // quad) aren't NDC -- normalize to a [-1, 1] box using the real
@@ -817,8 +1135,13 @@ int RealMain()
       ndc_positions.push_back({nx, ny, 0.0f});
     }
     draw_indices = real_geo->indices;
-    std::printf("using REAL decoded geometry: %zu vertices, %zu indices (from %s)\n",
-                ndc_positions.size(), draw_indices.size(), dump_path ? dump_path : "gx_vertex_dump.txt");
+    for (const auto& d : real_geo->draws)
+      if (d.state_index >= 0 && renderable_by_state.count(d.state_index))
+        draw_ranges.push_back(d);
+    std::printf("using REAL decoded geometry: %zu vertices, %zu indices, %zu real shader(s) across "
+               "%zu/%zu draw(s) (from %s)\n",
+               ndc_positions.size(), draw_indices.size(), renderables.size(), draw_ranges.size(),
+               real_geo->draws.size(), dump_path ? dump_path : "gx_vertex_dump.txt");
     std::printf("bbox: x=[%.2f,%.2f] y=[%.2f,%.2f] first_ndc=(%.3f,%.3f) last_ndc=(%.3f,%.3f)\n",
                 min_x, max_x, min_y, max_y, ndc_positions.front()[0], ndc_positions.front()[1],
                 ndc_positions.back()[0], ndc_positions.back()[1]);
@@ -827,21 +1150,58 @@ int RealMain()
   {
     ndc_positions = {{0.0f, 0.5f, 0.0f}, {0.5f, -0.5f, 0.0f}, {-0.5f, -0.5f, 0.0f}};
     draw_indices = {0, 1, 2};
-    std::printf("no real geometry dump found, using synthetic NDC triangle fallback\n");
+    std::printf(
+        "no real geometry/state available, using synthetic NDC triangle + fixed reference shader\n");
+    // Historical fixed reference state (this probe's original Phase 1
+    // captured snapshot), used only when there's no real per-draw state to
+    // build from at all.
+    static const std::array<std::uint32_t, 256> fallback_cp = [] {
+      std::array<std::uint32_t, 256> a{};
+      a[0x50u] = (1u << 13u) | (1u << 15u);
+      return a;
+    }();
+    static const std::array<std::uint32_t, 0x1058> fallback_xf = [] {
+      std::array<std::uint32_t, 0x1058> a{};
+      a[0x103fu] = 1u;
+      return a;
+    }();
+    static const std::array<std::uint32_t, 256> fallback_bp = [] {
+      std::array<std::uint32_t, 256> a{};
+      a[0x00u] = 0x4001;
+      a[0x28u] = 0x49040;
+      a[0x41u] = 0x4a0;
+      a[0xC0u] = 0x8fff8;
+      a[0xC1u] = 0x8ffc0;
+      return a;
+    }();
+    std::optional<RenderableState> built = BuildRenderableState(
+        device.Get(), info_queue.Get(), fallback_cp, fallback_xf, fallback_bp,
+        real_tex ? &*real_tex : nullptr, tex_w, tex_h, setup_cl.Get(), &staging_buffers);
+    if (!built)
+      Fail("fallback BuildRenderableState");
+    renderable_by_state[0] = renderables.size();
+    renderables.push_back(std::move(*built));
+    draw_ranges.push_back(DrawRange{0, static_cast<std::uint32_t>(draw_indices.size()), 0});
   }
 
+  if (renderables.empty())
+    Fail("no renderable state built (every real captured state failed to compile/link)");
+  const RenderableState& ref = renderables.front();
+  std::printf("PSO(s) created OK: %zu real shader(s) for %zu draw range(s).\n", renderables.size(),
+              draw_ranges.size());
+
+  // --- vertex buffer: real per-vertex position/color if a dump is
+  // available, else the synthetic NDC triangle fallback -- filled generically
+  // from the reference renderable's reflected layout: first attribute gets
+  // position, second gets real color (attribute index 1 is color0 in
+  // Dolphin's real vertex-shader input order -- see the is_color comment
+  // this replaced), everything else gets a 1.0f fill.
   std::vector<float> vertex_data;
   for (std::size_t v = 0; v < ndc_positions.size(); ++v)
   {
-    for (std::size_t attr = 0; attr < vs_stage.input_components.size(); ++attr)
+    for (std::size_t attr = 0; attr < ref.input_components.size(); ++attr)
     {
-      const int components = vs_stage.input_components[attr];
-      // spirv_cross's HLSL backend gives every non-SV_ vertex input a
-      // generic TEXCOORDn semantic (confirmed by dumping them: all 3
-      // attributes here report semantic=TEXCOORD), so there's no name to
-      // match against -- fall back to Dolphin's known real vertex-shader
-      // input order instead (rawpos, then rawcolor0, then rawcolor1; see
-      // VertexShaderGen.cpp), i.e. attribute index 1 is color0.
+      const int components = ref.input_components[attr];
       const bool is_color = (attr == 1);
       for (int c = 0; c < components; ++c)
       {
@@ -878,7 +1238,7 @@ int RealMain()
   D3D12_VERTEX_BUFFER_VIEW vbv{};
   vbv.BufferLocation = vertex_buffer->GetGPUVirtualAddress();
   vbv.SizeInBytes = vb_size;
-  vbv.StrideInBytes = vertex_stride;
+  vbv.StrideInBytes = ref.vertex_stride;
 
   const UINT ib_size = static_cast<UINT>(draw_indices.size() * sizeof(std::uint32_t));
   ComPtr<ID3D12Resource> index_buffer;
@@ -905,207 +1265,12 @@ int RealMain()
   ibv.SizeInBytes = ib_size;
   ibv.Format = DXGI_FORMAT_R32_UINT;
 
-  // --- constant buffers (1.0f fill + identity for any reflected mat4) ---
-  auto make_cbv_buffer = [&](UINT size) {
-    const UINT aligned = (size + 255) & ~255u;
-    ComPtr<ID3D12Resource> res;
-    D3D12_HEAP_PROPERTIES heap{D3D12_HEAP_TYPE_UPLOAD};
-    D3D12_RESOURCE_DESC rdesc{};
-    rdesc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-    rdesc.Width = aligned;
-    rdesc.Height = 1;
-    rdesc.DepthOrArraySize = 1;
-    rdesc.MipLevels = 1;
-    rdesc.SampleDesc.Count = 1;
-    rdesc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
-    device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &rdesc,
-                                    D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&res));
-    return std::make_pair(res, aligned);
-  };
-
-  std::vector<ComPtr<ID3D12Resource>> keep_alive_cbufs;
-  UINT cbv_srv_index = 0;
-  D3D12_CPU_DESCRIPTOR_HANDLE cbv_srv_cursor{};
-  if (cbv_srv_heap)
-    cbv_srv_cursor = cbv_srv_heap->GetCPUDescriptorHandleForHeapStart();
-  auto write_cbuffers = [&](StageReflection& stage) {
-    for (std::size_t i = 0; i < stage.cbuffers.size(); ++i)
-    {
-      auto [res, aligned] = make_cbv_buffer(stage.cbuffer_sizes[i]);
-      std::vector<std::uint8_t> data(aligned, 0);
-      FillIdentityAndOnes(&data, stage.cbuffer_mat4_offsets[i]);
-      void* mapped = nullptr;
-      res->Map(0, nullptr, &mapped);
-      std::memcpy(mapped, data.data(), aligned);
-      res->Unmap(0, nullptr);
-      D3D12_CONSTANT_BUFFER_VIEW_DESC cbvdesc{};
-      cbvdesc.BufferLocation = res->GetGPUVirtualAddress();
-      cbvdesc.SizeInBytes = aligned;
-      device->CreateConstantBufferView(&cbvdesc, cbv_srv_cursor);
-      cbv_srv_cursor.ptr += cbv_srv_stride;
-      keep_alive_cbufs.push_back(res);
-    }
-  };
-  write_cbuffers(vs_stage);
-
-  // --- textures: real decoded BT3 texture if available (Phase 3a), else a
-  // 4-quadrant diagnostic texture (distinct color per quadrant, so UV
-  // mapping correctness is visible in a framebuffer readback -- a flat
-  // checkerboard can't distinguish "wrong UVs" from "right UVs", a quadrant
-  // texture can) for every reflected texture slot.
-  const char* real_tex_path_env = std::getenv("MODERNGEKKO_REAL_TEXTURE_DUMP");
-  const std::string real_tex_path =
-      real_tex_path_env ? real_tex_path_env : std::string(dump_path ? dump_path : "gx_vertex_dump.txt") + ".tex";
-  const std::optional<RealTexture> real_tex = LoadRealTexture(real_tex_path.c_str());
-  const UINT tex_w = real_tex ? real_tex->width : 8u;
-  const UINT tex_h = real_tex ? real_tex->height : 8u;
-  if (real_tex)
-    std::printf("using REAL decoded texture: %ux%u (from %s)\n", tex_w, tex_h, real_tex_path.c_str());
-  else
-    std::printf("no real texture dump found/decodable at %s, using synthetic quadrant texture\n",
-               real_tex_path.c_str());
-
-  std::vector<ComPtr<ID3D12Resource>> keep_alive_textures;
-  auto write_textures = [&](StageReflection& stage, ID3D12GraphicsCommandList* cl) {
-    for (std::size_t i = 0; i < stage.textures.size(); ++i)
-    {
-      D3D12_HEAP_PROPERTIES heap{D3D12_HEAP_TYPE_DEFAULT};
-      D3D12_RESOURCE_DESC rdesc{};
-      rdesc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
-      rdesc.Width = tex_w;
-      rdesc.Height = tex_h;
-      rdesc.DepthOrArraySize = 1;
-      rdesc.MipLevels = 1;
-      rdesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
-      rdesc.SampleDesc.Count = 1;
-      ComPtr<ID3D12Resource> tex;
-      device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &rdesc,
-                                      D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&tex));
-      D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
-      srv.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
-      srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
-      srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-      srv.Texture2D.MipLevels = 1;
-      device->CreateShaderResourceView(tex.Get(), &srv, cbv_srv_cursor);
-      cbv_srv_cursor.ptr += cbv_srv_stride;
-      keep_alive_textures.push_back(tex);
-    }
-  };
-
-  // Upload buffer for texture data + one-time upload command list.
-  ComPtr<ID3D12CommandAllocator> setup_alloc;
-  device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&setup_alloc));
-  ComPtr<ID3D12GraphicsCommandList> setup_cl;
-  device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, setup_alloc.Get(), nullptr,
-                            IID_PPV_ARGS(&setup_cl));
-  write_textures(vs_stage, setup_cl.Get());
-  write_cbuffers(ps_stage);
-  write_textures(ps_stage, setup_cl.Get());
-  std::printf("checkpoint: cbuffers/textures written (%zu tex)\n", keep_alive_textures.size());
-
-  // Fill each texture (real decoded pixels, or the quadrant fallback) via a
-  // staging upload buffer + CopyTextureRegion. D3D12 requires each row of a
-  // placed footprint to be 256-byte aligned.
-  const UINT row_pitch = (tex_w * 4u + 255u) & ~255u;
-  std::vector<ComPtr<ID3D12Resource>> staging_buffers;
-  for (auto& tex : keep_alive_textures)
+  std::size_t total_tex = 0, total_cbuf = 0;
+  for (const auto& r : renderables)
   {
-    D3D12_HEAP_PROPERTIES heap{D3D12_HEAP_TYPE_UPLOAD};
-    D3D12_RESOURCE_DESC rdesc{};
-    rdesc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-    rdesc.Width = static_cast<UINT64>(row_pitch) * tex_h;
-    rdesc.Height = 1;
-    rdesc.DepthOrArraySize = 1;
-    rdesc.MipLevels = 1;
-    rdesc.SampleDesc.Count = 1;
-    rdesc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
-    ComPtr<ID3D12Resource> staging;
-    device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &rdesc,
-                                    D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
-                                    IID_PPV_ARGS(&staging));
-    std::vector<std::uint8_t> pixels(static_cast<std::size_t>(row_pitch) * tex_h, 0);
-    for (UINT y = 0; y < tex_h; ++y)
-    {
-      for (UINT x = 0; x < tex_w; ++x)
-      {
-        std::uint8_t* px = &pixels[y * row_pitch + x * 4];
-        if (real_tex)
-        {
-          const std::uint8_t* src = &real_tex->rgba8[(y * tex_w + x) * 4];
-          px[0] = src[0];
-          px[1] = src[1];
-          px[2] = src[2];
-          px[3] = src[3];
-        }
-        else
-        {
-          // 4 distinct-color quadrants: red/green/blue/yellow, so a
-          // readback can confirm UV orientation, not just "some texture".
-          const bool right = x >= tex_w / 2;
-          const bool bottom = y >= tex_h / 2;
-          if (!right && !bottom)
-          {
-            px[0] = 220; px[1] = 40; px[2] = 40;
-          }
-          else if (right && !bottom)
-          {
-            px[0] = 40; px[1] = 220; px[2] = 40;
-          }
-          else if (!right && bottom)
-          {
-            px[0] = 40; px[1] = 40; px[2] = 220;
-          }
-          else
-          {
-            px[0] = 220; px[1] = 220; px[2] = 40;
-          }
-          px[3] = 255;
-        }
-      }
-    }
-    void* mapped = nullptr;
-    staging->Map(0, nullptr, &mapped);
-    std::memcpy(mapped, pixels.data(), pixels.size());
-    staging->Unmap(0, nullptr);
-
-    D3D12_TEXTURE_COPY_LOCATION dst{};
-    dst.pResource = tex.Get();
-    dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-    dst.SubresourceIndex = 0;
-    D3D12_TEXTURE_COPY_LOCATION src{};
-    src.pResource = staging.Get();
-    src.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
-    src.PlacedFootprint.Footprint.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
-    src.PlacedFootprint.Footprint.Width = tex_w;
-    src.PlacedFootprint.Footprint.Height = tex_h;
-    src.PlacedFootprint.Footprint.Depth = 1;
-    src.PlacedFootprint.Footprint.RowPitch = row_pitch;
-    setup_cl->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
-
-    D3D12_RESOURCE_BARRIER barrier{};
-    barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-    barrier.Transition.pResource = tex.Get();
-    barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
-    barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
-    setup_cl->ResourceBarrier(1, &barrier);
-    staging_buffers.push_back(staging);
+    total_cbuf += r.vs_cbuf_count + r.ps_cbuf_count;
+    total_tex += r.vs_tex_count + r.ps_tex_count;
   }
-
-  // --- samplers ---
-  D3D12_CPU_DESCRIPTOR_HANDLE sampler_cursor{};
-  if (sampler_heap)
-  {
-    sampler_cursor = sampler_heap->GetCPUDescriptorHandleForHeapStart();
-    D3D12_SAMPLER_DESC sdesc{};
-    sdesc.Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
-    sdesc.AddressU = sdesc.AddressV = sdesc.AddressW = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
-    for (UINT i = 0; i < total_samplers; ++i)
-    {
-      device->CreateSampler(&sdesc, sampler_cursor);
-      sampler_cursor.ptr += sampler_stride;
-    }
-  }
-
   std::printf("checkpoint: about to close+execute setup command list\n");
   auto dump_info_queue = [&]() {
     if (!info_queue)
@@ -1177,14 +1342,15 @@ int RealMain()
     std::printf("checkpoint: setup fence wait complete\n");
   }
   CloseHandle(setup_event);
-  std::printf("Setup (textures/cbuffers) uploaded, %zu texture(s), %zu cbuffer(s) total.\n",
-              keep_alive_textures.size(), keep_alive_cbufs.size());
+  std::printf("Setup (textures/cbuffers) uploaded, %zu texture(s), %zu cbuffer(s) total across %zu "
+             "real shader(s).\n",
+             total_tex, total_cbuf, renderables.size());
 
   // --- per-frame command list + fence ---
   ComPtr<ID3D12CommandAllocator> frame_alloc;
   device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&frame_alloc));
   ComPtr<ID3D12GraphicsCommandList> cl;
-  device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, frame_alloc.Get(), pso.Get(),
+  device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, frame_alloc.Get(), ref.pso.Get(),
                             IID_PPV_ARGS(&cl));
   cl->Close();  // starts open; close it so the loop's first Reset() is valid
   ComPtr<ID3D12Fence> fence;
@@ -1208,7 +1374,7 @@ int RealMain()
 
     const UINT idx = swapchain->GetCurrentBackBufferIndex();
     frame_alloc->Reset();
-    cl->Reset(frame_alloc.Get(), pso.Get());
+    cl->Reset(frame_alloc.Get(), nullptr);  // PSO set per draw range below
 
     D3D12_RESOURCE_BARRIER to_rt{};
     to_rt.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
@@ -1223,37 +1389,47 @@ int RealMain()
     cl->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
     cl->RSSetViewports(1, &viewport);
     cl->RSSetScissorRects(1, &scissor);
-    cl->SetGraphicsRootSignature(root_sig.Get());
-
-    std::vector<ID3D12DescriptorHeap*> heaps;
-    if (cbv_srv_heap)
-      heaps.push_back(cbv_srv_heap.Get());
-    if (sampler_heap)
-      heaps.push_back(sampler_heap.Get());
-    if (!heaps.empty())
-      cl->SetDescriptorHeaps(static_cast<UINT>(heaps.size()), heaps.data());
-
-    UINT root_index = 0;
-    D3D12_GPU_DESCRIPTOR_HANDLE cbv_srv_gpu_cursor{};
-    if (cbv_srv_heap)
-      cbv_srv_gpu_cursor = cbv_srv_heap->GetGPUDescriptorHandleForHeapStart();
-    auto bind_table = [&](std::size_t count) {
-      if (count == 0)
-        return;
-      cl->SetGraphicsRootDescriptorTable(root_index++, cbv_srv_gpu_cursor);
-      cbv_srv_gpu_cursor.ptr += count * cbv_srv_stride;
-    };
-    bind_table(vs_stage.cbuffers.size());
-    bind_table(vs_stage.textures.size());
-    bind_table(ps_stage.cbuffers.size());
-    bind_table(ps_stage.textures.size());
-    if (total_samplers > 0)
-      cl->SetGraphicsRootDescriptorTable(root_index++, sampler_heap->GetGPUDescriptorHandleForHeapStart());
-
     cl->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     cl->IASetVertexBuffers(0, 1, &vbv);
     cl->IASetIndexBuffer(&ibv);
-    cl->DrawIndexedInstanced(static_cast<UINT>(draw_indices.size()), 1, 0, 0, 0);
+
+    // Phase 8: one draw call per DrawRange, each using ITS OWN real
+    // captured shader/PSO/resources (not one shared stand-in) -- the whole
+    // point of this phase.
+    for (const DrawRange& range : draw_ranges)
+    {
+      const RenderableState& r = renderables[renderable_by_state.at(range.state_index)];
+      cl->SetPipelineState(r.pso.Get());
+      cl->SetGraphicsRootSignature(r.root_sig.Get());
+
+      std::vector<ID3D12DescriptorHeap*> heaps;
+      if (r.cbv_srv_heap)
+        heaps.push_back(r.cbv_srv_heap.Get());
+      if (r.sampler_heap)
+        heaps.push_back(r.sampler_heap.Get());
+      if (!heaps.empty())
+        cl->SetDescriptorHeaps(static_cast<UINT>(heaps.size()), heaps.data());
+
+      UINT root_index = 0;
+      D3D12_GPU_DESCRIPTOR_HANDLE cbv_srv_gpu_cursor{};
+      if (r.cbv_srv_heap)
+        cbv_srv_gpu_cursor = r.cbv_srv_heap->GetGPUDescriptorHandleForHeapStart();
+      auto bind_table = [&](std::size_t count) {
+        if (count == 0)
+          return;
+        cl->SetGraphicsRootDescriptorTable(root_index++, cbv_srv_gpu_cursor);
+        cbv_srv_gpu_cursor.ptr += count * r.cbv_srv_stride;
+      };
+      bind_table(r.vs_cbuf_count);
+      bind_table(r.vs_tex_count);
+      bind_table(r.ps_cbuf_count);
+      bind_table(r.ps_tex_count);
+      if (r.total_samplers > 0)
+        cl->SetGraphicsRootDescriptorTable(root_index++,
+                                           r.sampler_heap->GetGPUDescriptorHandleForHeapStart());
+
+      cl->DrawIndexedInstanced(range.index_count, 1, range.index_start, 0, 0);
+    }
 
     D3D12_RESOURCE_BARRIER to_present = to_rt;
     to_present.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;

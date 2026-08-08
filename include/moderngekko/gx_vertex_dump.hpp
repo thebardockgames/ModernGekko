@@ -6,6 +6,7 @@
 #include <chrono>
 #include <cstdint>
 #include <string>
+#include <unordered_map>
 
 namespace moderngekko
 {
@@ -25,6 +26,11 @@ public:
   // skip_seconds delays capture start so an automated/quick session doesn't
   // just grab the boot/menu flow's geometry+texture -- see
   // MODERNGEKKO_GX_VERTEX_DUMP_SKIP_SECONDS in MaybeEnableGxVertexDump.
+  // Phase 8: also writes each draw's real CP/XF/BP register state (needed
+  // to compile THAT draw's own real shader instead of one shared stand-in)
+  // to a companion "<vertex_path>.states" binary, deduplicated by content
+  // hash since many draws share identical state. Each "=== draw N ==="
+  // block in the text dump gets a "state=<index>" line referencing it.
   GxVertexDumpDevice(std::string vertex_path, std::string texture_path, const AddressSpace* memory,
                      int max_draws = 16, double skip_seconds = 0.0);
 
@@ -62,6 +68,12 @@ private:
   double m_skip_seconds = 0.0;
   int m_scanned = 0;
   static constexpr int m_max_scanned = 100000;
+
+  // Phase 8: per-draw real CP/XF/BP state dump, deduplicated by hash.
+  std::string m_states_path;
+  std::unordered_map<std::uint64_t, int> m_state_index_by_hash;
+  int m_states_written = 0;
+  int WriteOrReuseState(const GxStateView& state);
 };
 
 // Opt-in via MODERNGEKKO_GX_VERTEX_DUMP=<path>. If MODERNGEKKO_GX_LOG is also

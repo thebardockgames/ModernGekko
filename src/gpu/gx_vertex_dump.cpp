@@ -21,8 +21,57 @@ GxVertexDumpDevice::GxVertexDumpDevice(std::string vertex_path, std::string text
                                        const AddressSpace* memory, int max_draws,
                                        double skip_seconds)
     : m_vertex_path(std::move(vertex_path)), m_texture_path(std::move(texture_path)),
-      m_memory(memory), m_max_draws(max_draws), m_skip_seconds(skip_seconds)
+      m_memory(memory), m_max_draws(max_draws), m_skip_seconds(skip_seconds),
+      m_states_path(m_vertex_path + ".states")
 {
+}
+
+// Writes state.cp/xf/bp (256/0x1058/256 u32 each -- the real backing sizes
+// in GxStateBackend) to m_states_path if not already seen (FNV-1a hash of
+// the raw bytes), and returns the state's index either way. Real BT3
+// capture data is heavy on repeated state across many draws (shared
+// materials/UI elements), so dedup keeps the file small and avoids
+// recompiling identical shaders later on the render side.
+int GxVertexDumpDevice::WriteOrReuseState(const GxStateView& state)
+{
+  std::uint64_t hash = 1469598103934665603ull;  // FNV-1a offset basis
+  auto mix = [&hash](std::span<const std::uint32_t> span) {
+    const auto* bytes = reinterpret_cast<const std::uint8_t*>(span.data());
+    for (std::size_t i = 0; i < span.size() * sizeof(std::uint32_t); ++i)
+    {
+      hash ^= bytes[i];
+      hash *= 1099511628211ull;  // FNV-1a prime
+    }
+  };
+  mix(state.cp);
+  mix(state.xf);
+  mix(state.bp);
+
+  const auto it = m_state_index_by_hash.find(hash);
+  if (it != m_state_index_by_hash.end())
+    return it->second;
+
+  const int index = m_states_written;
+  std::ofstream out(m_states_path,
+                    std::ios::out | std::ios::binary | (index == 0 ? std::ios::trunc : std::ios::app));
+  auto write_span = [&out](std::span<const std::uint32_t> span, std::size_t expected_size) {
+    // Always write a fixed-size record regardless of the real span's
+    // length (it can be shorter near the start of a session before every
+    // register has been touched), zero-padding the rest, so the render
+    // side can seek to index * kRecordSize without needing per-record
+    // length prefixes.
+    std::vector<std::uint32_t> padded(expected_size, 0);
+    std::copy_n(span.data(), std::min(span.size(), expected_size), padded.data());
+    out.write(reinterpret_cast<const char*>(padded.data()),
+              static_cast<std::streamsize>(expected_size * sizeof(std::uint32_t)));
+  };
+  write_span(state.cp, 256);
+  write_span(state.xf, 0x1058);
+  write_span(state.bp, 256);
+
+  m_state_index_by_hash[hash] = index;
+  ++m_states_written;
+  return index;
 }
 
 namespace
@@ -213,11 +262,17 @@ void GxVertexDumpDevice::SubmitDecodedDraw(const GxDrawPacket&, const GxDecodedD
   if (m_draws_written >= m_max_draws)
     return;
 
+  // Phase 8: record which real CP/XF/BP state this draw was submitted
+  // under, so the render side can compile THIS draw's own real shader
+  // instead of sharing one fixed stand-in state across every draw.
+  const int state_index = WriteOrReuseState(state);
+
   std::ofstream out(m_vertex_path, std::ios::out | (m_draws_written == 0 ? std::ios::trunc
                                                                           : std::ios::app));
   if (m_draws_written == 0)
-    out << "# ModernGekko real decoded draw dump (Phase 2b/3b native-renderer scoping)\n";
+    out << "# ModernGekko real decoded draw dump (Phase 2b/3b/8 native-renderer scoping)\n";
   out << "=== draw " << m_draws_written << " ===\n";
+  out << "state=" << state_index << "\n";
   out << "topology=" << static_cast<int>(decoded.topology)
       << " vertex_count=" << decoded.vertices.size()
       << " index_count=" << decoded.indices.size() << "\n";
