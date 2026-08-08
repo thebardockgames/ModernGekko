@@ -15,6 +15,8 @@
 #include <fstream>
 #include <mutex>
 
+#include <windows.h>
+
 namespace moderngekko
 {
 GxVertexDumpDevice::GxVertexDumpDevice(std::string vertex_path, std::string texture_path,
@@ -238,6 +240,9 @@ void GxVertexDumpDevice::SubmitDecodedDraw(const GxDrawPacket&, const GxDecodedD
   if (Done() || decoded.vertices.size() < 3)
     return;
 
+  if (!m_armed)
+    return;
+
   if (m_skip_seconds > 0.0)
   {
     const double elapsed =
@@ -303,6 +308,22 @@ void OnRawFifoBytesForDump(const std::uint8_t* data, std::size_t size)
   std::lock_guard<std::mutex> lock(s_gx_dump_mutex);
   if (!s_gx_dump_processor || s_gx_dump_device->Done())
     return;
+
+  // F9 (edge-triggered, not the raw held-key high bit) toggles capture
+  // arming, so the player controls exactly when real gameplay starts being
+  // recorded instead of guessing a fixed skip-seconds boot/menu delay --
+  // real boot+menu time varies session to session and a delay that's too
+  // short just re-captures menu content, one that's too long can run past
+  // a short play session without ever arming.
+  static bool s_f9_was_down = false;
+  const bool f9_down = (GetAsyncKeyState(VK_F9) & 0x8000) != 0;
+  if (f9_down && !s_f9_was_down)
+  {
+    s_gx_dump_device->ToggleArmed();
+    std::fprintf(stderr, "[gx_vertex_dump] capture %s (F9)\n",
+                s_gx_dump_device->IsArmed() ? "ARMED" : "PAUSED");
+  }
+  s_f9_was_down = f9_down;
 
   // Refresh our private memory snapshot from the real running game's RAM
   // right before parsing more FIFO bytes, so indexed vertex-array reads and

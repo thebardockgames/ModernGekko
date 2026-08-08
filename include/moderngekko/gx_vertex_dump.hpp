@@ -40,6 +40,14 @@ public:
   void SubmitDecodedDraw(const GxDrawPacket& packet, const GxDecodedDraw& decoded,
                          const GxStateView& state) override;
 
+  // F9-gated manual arming: starts disarmed so boot/menu content never
+  // fills up the (small, one-shot) draw budget before the player actually
+  // reaches the content they want captured -- guessing a fixed
+  // skip-seconds delay was unreliable (real boot+menu time varies session
+  // to session). Edge-triggered toggle, polled from OnRawFifoBytesForDump.
+  void ToggleArmed() { m_armed = !m_armed; }
+  bool IsArmed() const { return m_armed; }
+
   // The texture's TLUT is populated asynchronously by Dolphin's real video
   // thread (see MaybeDumpTexture) and may lag behind the vertex captures by
   // many draws, so texture completion is tracked separately with its own
@@ -56,6 +64,7 @@ private:
   // real, non-degenerate (not flat/fully-transparent) texture.
   bool TryDumpTextureUnit(const GxStateView& state, std::uint32_t unit);
 
+  bool m_armed = false;
   std::string m_vertex_path;
   std::string m_texture_path;
   const AddressSpace* m_memory = nullptr;
