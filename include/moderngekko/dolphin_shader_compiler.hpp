@@ -4,6 +4,7 @@
 
 #include <cstdint>
 #include <string>
+#include <vector>
 
 namespace moderngekko
 {
@@ -70,6 +71,16 @@ struct DolphinShaderBundle
   std::uint64_t geometry_uid = 0;
   std::uint64_t uber_vertex_uid = 0;
   std::uint64_t uber_pixel_uid = 0;
+
+  // Phase 9: raw bytes of a real PixelShaderConstants (see
+  // vendor/dolphin_legacy's ConstantManager.h), computed from this exact
+  // draw's captured BPMemory/XFMemory state via PixelShaderManager -- the
+  // real TEV konst/material colors, alpha-test reference, blend mode, and
+  // fog state that a generic identity/1.0f cbuffer fill can't provide.
+  // Byte-for-byte matches the real shader's PSBlock cbuffer layout (see
+  // PixelShaderGen.cpp's UBO declaration), so the render side can memcpy
+  // this directly once it confirms the reflected cbuffer size matches.
+  std::vector<std::uint8_t> pixel_constants;
 };
 
 class DolphinShaderCompiler final

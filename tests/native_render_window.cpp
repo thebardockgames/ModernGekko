@@ -95,7 +95,8 @@ void Fail(const char* what, HRESULT hr = S_OK)
 bool CompileShaderForState(std::span<const std::uint32_t> cp, std::span<const std::uint32_t> xf,
                            std::span<const std::uint32_t> bp, std::string* vs_hlsl_storage,
                            std::string* ps_hlsl_storage, ComPtr<ID3DBlob>* out_vs_blob,
-                           ComPtr<ID3DBlob>* out_ps_blob)
+                           ComPtr<ID3DBlob>* out_ps_blob,
+                           std::vector<std::uint8_t>* out_pixel_constants)
 {
   const moderngekko::DolphinShaderBundle shaders = moderngekko::DolphinShaderCompiler::Compile(
       {cp, xf, bp}, moderngekko::GxTopology::Triangles, 0, moderngekko::DolphinShaderApi::D3d);
@@ -104,6 +105,7 @@ bool CompileShaderForState(std::span<const std::uint32_t> cp, std::span<const st
     std::fprintf(stderr, "shader generation produced empty source\n");
     return false;
   }
+  *out_pixel_constants = shaders.pixel_constants;
 
   const std::string vs_full = std::string(kShaderHeader) + shaders.vertex;
   const std::string ps_full = std::string(kShaderHeader) + shaders.pixel;
@@ -569,7 +571,8 @@ std::optional<RenderableState> BuildRenderableState(
 {
   std::string vs_hlsl, ps_hlsl;
   ComPtr<ID3DBlob> vs_blob, ps_blob;
-  if (!CompileShaderForState(cp, xf, bp, &vs_hlsl, &ps_hlsl, &vs_blob, &ps_blob))
+  std::vector<std::uint8_t> pixel_constants;
+  if (!CompileShaderForState(cp, xf, bp, &vs_hlsl, &ps_hlsl, &vs_blob, &ps_blob, &pixel_constants))
     return std::nullopt;
 
   ComPtr<ID3D12ShaderReflection> vs_refl, ps_refl;
@@ -793,12 +796,23 @@ std::optional<RenderableState> BuildRenderableState(
   D3D12_CPU_DESCRIPTOR_HANDLE cbv_srv_cursor{};
   if (rs.cbv_srv_heap)
     cbv_srv_cursor = rs.cbv_srv_heap->GetCPUDescriptorHandleForHeapStart();
-  auto write_cbuffers = [&](StageReflection& stage) {
+  // Phase 9: if this stage's cbuffer is exactly the size of a real
+  // PixelShaderConstants blob (real_constants non-null and size-matched),
+  // upload those real per-draw bytes instead of FillIdentityAndOnes'
+  // generic identity/1.0f fill -- see BuildRealPixelConstants in
+  // dolphin_shader_compiler.cpp for how they're computed. Falls back to the
+  // generic fill if the sizes don't match (e.g. the VS stage, or a PS
+  // cbuffer layout this probe doesn't recognize), so this can't corrupt
+  // memory on a mismatch.
+  auto write_cbuffers = [&](StageReflection& stage, const std::vector<std::uint8_t>* real_constants) {
     for (std::size_t i = 0; i < stage.cbuffers.size(); ++i)
     {
       auto [res, aligned] = make_cbv_buffer(stage.cbuffer_sizes[i]);
       std::vector<std::uint8_t> data(aligned, 0);
-      FillIdentityAndOnes(&data, stage.cbuffer_mat4_offsets[i]);
+      if (real_constants && real_constants->size() == stage.cbuffer_sizes[i])
+        std::memcpy(data.data(), real_constants->data(), real_constants->size());
+      else
+        FillIdentityAndOnes(&data, stage.cbuffer_mat4_offsets[i]);
       void* mapped = nullptr;
       res->Map(0, nullptr, &mapped);
       std::memcpy(mapped, data.data(), aligned);
@@ -811,7 +825,7 @@ std::optional<RenderableState> BuildRenderableState(
       rs.keep_alive.push_back(res);
     }
   };
-  write_cbuffers(vs_stage);
+  write_cbuffers(vs_stage, nullptr);
 
   auto write_textures = [&](StageReflection& stage) {
     for (std::size_t i = 0; i < stage.textures.size(); ++i)
@@ -919,7 +933,7 @@ std::optional<RenderableState> BuildRenderableState(
     }
   };
   write_textures(vs_stage);
-  write_cbuffers(ps_stage);
+  write_cbuffers(ps_stage, &pixel_constants);
   write_textures(ps_stage);
 
   if (rs.sampler_heap)

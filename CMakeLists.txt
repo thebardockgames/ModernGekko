@@ -173,6 +173,7 @@ add_library(moderngekko_dolphin_video STATIC
     vendor/dolphin_legacy/VideoCommon/ShaderGenCommon.cpp
     vendor/dolphin_legacy/VideoCommon/LightingShaderGen.cpp
     vendor/dolphin_legacy/VideoCommon/PixelShaderGen.cpp
+    vendor/dolphin_legacy/VideoCommon/RenderState.cpp
     vendor/dolphin_legacy/VideoCommon/VertexShaderGen.cpp
     vendor/dolphin_legacy/VideoCommon/GeometryShaderGen.cpp
     vendor/dolphin_legacy/VideoCommon/DriverDetails.cpp
