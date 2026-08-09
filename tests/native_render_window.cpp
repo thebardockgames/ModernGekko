@@ -213,6 +213,13 @@ struct DrawRange
   std::uint32_t index_start = 0;
   std::uint32_t index_count = 0;
   int state_index = -1;
+  // Phase 9c: this draw's own slice of the merged vertex buffer (vertices
+  // are appended strictly in draw order in LoadRealGeometry, so each
+  // draw's positions are contiguous), used to normalize each draw into its
+  // own visible NDC box instead of one shared box across every merged draw
+  // -- see the comment at the per-draw NDC loop below.
+  std::uint32_t vertex_start = 0;
+  std::uint32_t vertex_count = 0;
 };
 
 struct RealGeometry
@@ -282,7 +289,8 @@ std::optional<RealGeometry> LoadRealGeometry(const char* path)
     if (line.rfind("=== draw", 0) == 0)
     {
       draw_base_vertex = static_cast<std::uint32_t>(geo.positions.size());
-      geo.draws.push_back(DrawRange{static_cast<std::uint32_t>(geo.indices.size()), 0, -1});
+      geo.draws.push_back(
+          DrawRange{static_cast<std::uint32_t>(geo.indices.size()), 0, -1, draw_base_vertex, 0});
       continue;
     }
     if (line.rfind("state=", 0) == 0)
@@ -347,6 +355,10 @@ std::optional<RealGeometry> LoadRealGeometry(const char* path)
                                         ? geo.draws[i + 1].index_start
                                         : static_cast<std::uint32_t>(geo.indices.size());
     geo.draws[i].index_count = range_end - geo.draws[i].index_start;
+    const std::uint32_t vertex_range_end = (i + 1 < geo.draws.size())
+                                                ? geo.draws[i + 1].vertex_start
+                                                : static_cast<std::uint32_t>(geo.positions.size());
+    geo.draws[i].vertex_count = vertex_range_end - geo.draws[i].vertex_start;
   }
   return geo;
 }
@@ -1127,26 +1139,52 @@ int RealMain()
   if (real_geo && !renderables.empty())
   {
     // Raw GX vertex-space coordinates (e.g. 0..128, 0..224 for a UI/HUD
-    // quad) aren't NDC -- normalize to a [-1, 1] box using the real
-    // geometry's own bounding box so it's visible regardless of the
-    // source draw call's coordinate range, flipping Y since GX's origin
-    // is top-left while D3D NDC's +Y is up.
-    float min_x = real_geo->positions[0][0], max_x = min_x;
-    float min_y = real_geo->positions[0][1], max_y = min_y;
-    for (const auto& p : real_geo->positions)
+    // quad) aren't NDC -- normalize to a [-1, 1] box, flipping Y since GX's
+    // origin is top-left while D3D NDC's +Y is up.
+    //
+    // Phase 9c: normalize PER DRAW (each draw's own bounding box) instead
+    // of one shared box across every merged draw. A single shared box
+    // preserves real relative screen-space layout, but a real capture can
+    // mix wildly different real-world scales in one merged set (e.g. a
+    // full-screen effect/stage-floor draw alongside a small UI icon or
+    // character-scale draw) -- Phase 9b's first two real combat captures
+    // both landed on exactly this: one huge draw's span dominated the
+    // shared box and everything else collapsed to an invisible sliver.
+    // Normalizing per draw trades away relative real-world positioning
+    // (every draw now fills roughly the same visible area, so several
+    // draws will visually overlap) for actually being able to SEE what
+    // each individual draw's real shape is -- the actual goal when hunting
+    // for character geometry that might otherwise be swamped like this.
+    ndc_positions.resize(real_geo->positions.size(), {0.0f, 0.0f, 0.0f});
+    float smallest_span = -1.0f, largest_span = -1.0f;
+    for (const auto& d : real_geo->draws)
     {
-      min_x = std::min(min_x, p[0]);
-      max_x = std::max(max_x, p[0]);
-      min_y = std::min(min_y, p[1]);
-      max_y = std::max(max_y, p[1]);
-    }
-    const float span_x = (max_x - min_x) > 1e-3f ? (max_x - min_x) : 1.0f;
-    const float span_y = (max_y - min_y) > 1e-3f ? (max_y - min_y) : 1.0f;
-    for (const auto& p : real_geo->positions)
-    {
-      const float nx = ((p[0] - min_x) / span_x) * 1.6f - 0.8f;
-      const float ny = -(((p[1] - min_y) / span_y) * 1.6f - 0.8f);
-      ndc_positions.push_back({nx, ny, 0.0f});
+      if (d.vertex_count == 0)
+        continue;
+      float min_x = real_geo->positions[d.vertex_start][0], max_x = min_x;
+      float min_y = real_geo->positions[d.vertex_start][1], max_y = min_y;
+      for (std::uint32_t vi = d.vertex_start; vi < d.vertex_start + d.vertex_count; ++vi)
+      {
+        const auto& p = real_geo->positions[vi];
+        min_x = std::min(min_x, p[0]);
+        max_x = std::max(max_x, p[0]);
+        min_y = std::min(min_y, p[1]);
+        max_y = std::max(max_y, p[1]);
+      }
+      const float span_x = (max_x - min_x) > 1e-3f ? (max_x - min_x) : 1.0f;
+      const float span_y = (max_y - min_y) > 1e-3f ? (max_y - min_y) : 1.0f;
+      const float span = std::max(span_x, span_y);
+      if (smallest_span < 0.0f || span < smallest_span)
+        smallest_span = span;
+      if (span > largest_span)
+        largest_span = span;
+      for (std::uint32_t vi = d.vertex_start; vi < d.vertex_start + d.vertex_count; ++vi)
+      {
+        const auto& p = real_geo->positions[vi];
+        const float nx = ((p[0] - min_x) / span_x) * 1.6f - 0.8f;
+        const float ny = -(((p[1] - min_y) / span_y) * 1.6f - 0.8f);
+        ndc_positions[vi] = {nx, ny, 0.0f};
+      }
     }
     draw_indices = real_geo->indices;
     for (const auto& d : real_geo->draws)
@@ -1156,9 +1194,9 @@ int RealMain()
                "%zu/%zu draw(s) (from %s)\n",
                ndc_positions.size(), draw_indices.size(), renderables.size(), draw_ranges.size(),
                real_geo->draws.size(), dump_path ? dump_path : "gx_vertex_dump.txt");
-    std::printf("bbox: x=[%.2f,%.2f] y=[%.2f,%.2f] first_ndc=(%.3f,%.3f) last_ndc=(%.3f,%.3f)\n",
-                min_x, max_x, min_y, max_y, ndc_positions.front()[0], ndc_positions.front()[1],
-                ndc_positions.back()[0], ndc_positions.back()[1]);
+    std::printf("per-draw bbox spans (real GX vertex-space units): smallest=%.2f largest=%.2f "
+               "(ratio %.1fx -- how much a shared bbox would have swamped the smallest draw)\n",
+               smallest_span, largest_span, largest_span / smallest_span);
   }
   else
   {
