@@ -248,6 +248,7 @@ if(MODERNGEKKO_ENABLE_DOLPHIN_RUNTIME)
         src/gpu/gx_vertex_dump.cpp
         src/gpu/gx_texture_decoder.cpp
         src/memory/address_space.cpp
+        src/runtime/save_state.cpp
         vendor/dolphin/Source/Core/DolphinNoGUI/Platform.cpp
         vendor/dolphin/Source/Core/DolphinNoGUI/PlatformHeadless.cpp
     )

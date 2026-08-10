@@ -7,9 +7,13 @@
 #include "Core/Boot/BootManager.h"
 #include "Core/Config/MainSettings.h"
 #include "Core/Config/GraphicsSettings.h"
+#include "Core/Config/WiimoteSettings.h"
 #include "Core/Core.h"
 #include "Core/Host.h"
 #include "Core/HW/GBACore.h"
+#include "Core/HW/SI/SI_Device.h"
+#include "Core/HW/Wiimote.h"
+#include "Core/Movie.h"
 #include "Core/PowerPC/JitInterface.h"
 #include "Core/PowerPC/PowerPC.h"
 #include "Core/PowerPC/StaticRecomp/StaticRecompModuleSource.h"
@@ -21,14 +25,18 @@
 #include "moderngekko/gx_logging_backend.hpp"
 #include "moderngekko/gx_vertex_dump.hpp"
 #include "moderngekko/module_loader.hpp"
+#include "moderngekko/save_state.hpp"
 
 #include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstddef>
+#include <cstdio>
+#include <cstdlib>
 #include <fmt/format.h>
 #include <mutex>
+#include <optional>
 #include <thread>
 #include <utility>
 
@@ -48,6 +56,71 @@ std::string FormatWindowTitle(const std::string& title, double fps)
   if (!std::isfinite(fps) || fps < 0.0)
     fps = 0.0;
   return fmt::format("{} | {:.1f} FPS", title, fps);
+}
+
+// Phase 10 native-renderer scoping: opt-in TAS movie record/playback, so a
+// capture round can be reproduced without a human re-playing the game every
+// time. Dolphin's own frontends (see DolphinQt's MainWindow::OnStartRecording/
+// OnPlayRecording) call Movie::MovieManager::BeginRecordingInput/PlayInput
+// BEFORE BootManager::BootCore -- this must happen at the same point here,
+// or the recording/playback never actually attaches to the boot.
+bool s_movie_recording_active = false;
+std::string s_movie_record_path;
+
+void MaybeConfigureMovie()
+{
+  auto& movie = Core::System::GetInstance().GetMovie();
+  if (const char* play_path = std::getenv("MODERNGEKKO_MOVIE_PLAY"))
+  {
+    std::optional<std::string> savestate_path;
+    if (!movie.PlayInput(play_path, &savestate_path))
+    {
+      std::fprintf(stderr, "[movie] failed to start playback of %s\n", play_path);
+      return;
+    }
+    if (savestate_path)
+    {
+      // Every recording made via MaybeConfigureMovie() below is a cold-boot
+      // recording (BeginRecordingInput(), never a save-state-based one), so
+      // a real .dtm produced by this project should never come back with a
+      // save-state path -- flag it rather than silently ignoring, since we
+      // don't load one.
+      std::fprintf(stderr,
+                   "[movie] warning: %s references a savestate (%s), which this probe does not "
+                   "load -- playback will likely desync\n",
+                   play_path, savestate_path->c_str());
+    }
+    std::fprintf(stderr, "[movie] playing back %s\n", play_path);
+    return;
+  }
+  if (const char* record_path = std::getenv("MODERNGEKKO_MOVIE_RECORD"))
+  {
+    // Mirrors DolphinQt's MainWindow::OnStartRecording controller-array
+    // construction exactly (see vendor/dolphin/Source/Core/DolphinQt/
+    // MainWindow.cpp), since Movie::MovieManager::BeginRecordingInput
+    // records against whatever this reports, not the live SI/Wiimote state.
+    Movie::ControllerTypeArray controllers{};
+    Movie::WiimoteEnabledArray wiimotes{};
+    for (int i = 0; i < 4; ++i)
+    {
+      const SerialInterface::SIDevices si_device = Config::Get(Config::GetInfoForSIDevice(i));
+      if (si_device == SerialInterface::SIDEVICE_GC_GBA_EMULATED)
+        controllers[i] = Movie::ControllerType::GBA;
+      else if (SerialInterface::SIDevice_IsGCController(si_device))
+        controllers[i] = Movie::ControllerType::GC;
+      else
+        controllers[i] = Movie::ControllerType::None;
+      wiimotes[i] = Config::Get(Config::GetInfoForWiimoteSource(i)) != WiimoteSource::None;
+    }
+    if (!movie.BeginRecordingInput(controllers, wiimotes))
+    {
+      std::fprintf(stderr, "[movie] failed to start recording to %s\n", record_path);
+      return;
+    }
+    s_movie_recording_active = true;
+    s_movie_record_path = record_path;
+    std::fprintf(stderr, "[movie] recording input to %s\n", record_path);
+  }
 }
 }
 
@@ -293,6 +366,10 @@ RuntimeRunResult Runtime::Run()
     if (state == Core::State::Uninitialized && m_impl->platform)
       m_impl->platform->Stop();
   });
+  // Phase 10: opt-in via MODERNGEKKO_MOVIE_RECORD=<path.dtm> /
+  // MODERNGEKKO_MOVIE_PLAY=<path.dtm>. Must run before BootCore -- see
+  // MaybeConfigureMovie()'s comment.
+  MaybeConfigureMovie();
   if (!BootManager::BootCore(Core::System::GetInstance(), std::move(boot),
                              m_impl->platform->GetWindowSystemInfo()))
   {
@@ -301,6 +378,19 @@ RuntimeRunResult Runtime::Run()
             RuntimeError{RuntimeErrorCode::BootFailed, "Dolphin could not boot sys/main.dol"}};
   }
   m_impl->booted = true;
+  // Phase 10b: opt-in save-state load via MODERNGEKKO_LOAD_STATE=<path>, the
+  // primary (simpler than movie replay) mechanism for skipping straight to
+  // real gameplay -- see save_state.hpp. Must run after BootCore (HW::Init
+  // has already run State::Init by this point) and before MainLoop, same
+  // placement rationale as MaybeConfigureMovie() above but for the opposite
+  // boot phase.
+  MaybeLoadStateOnBoot();
+  // Phase 10b: opt-in F10 save-state hotkey via
+  // MODERNGEKKO_SAVE_STATE_HOTKEY=<path>, for the one-time human session that
+  // captures "I'm in real combat right now" for MODERNGEKKO_LOAD_STATE to
+  // reuse on every future headless run. No-op (non-joinable) jthread if the
+  // env var is unset; stops and joins automatically when Run() returns.
+  std::jthread save_state_hotkey_thread = MaybeStartSaveStateHotkeyThread();
   std::jthread title_thread;
   if (!m_impl->config.headless && m_impl->config.show_fps_in_title)
   {
@@ -313,11 +403,47 @@ RuntimeRunResult Runtime::Run()
       }
     });
   }
+  // Phase 10: periodic autosave while recording, in addition to the
+  // graceful-exit save below. A human closing the window normally already
+  // exercises the graceful path (MainLoop() returns -> save below), but a
+  // hard kill (crash, forced process termination -- e.g. how this project's
+  // own headless test/verification runs are stopped throughout this
+  // session) never runs any C++ cleanup at all, which would otherwise lose
+  // the whole recording. Re-saving every few seconds bounds that loss to a
+  // few seconds' worth of input instead of the entire session.
+  std::jthread movie_autosave_thread;
+  if (s_movie_recording_active)
+  {
+    movie_autosave_thread = std::jthread([](std::stop_token stop_token) {
+      while (!stop_token.stop_requested())
+      {
+        for (int i = 0; i < 20 && !stop_token.stop_requested(); ++i)
+          std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        if (!stop_token.stop_requested())
+          Core::System::GetInstance().GetMovie().SaveRecording(s_movie_record_path);
+      }
+    });
+  }
   m_impl->platform->MainLoop();
   title_thread.request_stop();
   if (title_thread.joinable())
     title_thread.join();
+  movie_autosave_thread.request_stop();
+  if (movie_autosave_thread.joinable())
+    movie_autosave_thread.join();
   m_impl->platform->SaveWindowGeometry();
+  if (s_movie_recording_active)
+  {
+    // MovieManager accumulates recorded input in memory (m_temp_input) and
+    // only writes the .dtm out on an explicit SaveRecording() call (mirrors
+    // DolphinQt's separate "Export Recording" action) -- this must happen
+    // before Core::Shutdown() destroys the System the recording lives in,
+    // but doesn't need Core::Stop() to have finished (SaveRecording() only
+    // reads accumulated state/config, it doesn't touch the running core).
+    Core::System::GetInstance().GetMovie().SaveRecording(s_movie_record_path);
+    std::fprintf(stderr, "[movie] saved recording to %s\n", s_movie_record_path.c_str());
+    s_movie_recording_active = false;
+  }
   Core::Stop(Core::System::GetInstance());
   Core::Shutdown(Core::System::GetInstance());
   m_impl->booted = false;
