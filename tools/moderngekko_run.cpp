@@ -1,13 +1,16 @@
 #include "moderngekko/game.hpp"
 #include "moderngekko/runtime.hpp"
 #include "frontend_config.hpp"
+#include "native_presenter.hpp"
 
 #include <chrono>
+#include <cmath>
 #include <csignal>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <optional>
 #include <string>
 #include <thread>
 #include <vector>
@@ -34,8 +37,16 @@ void Usage()
   std::cerr << "usage: " MODERNGEKKO_RUNNER_NAME
                " [--game <extracted-root>] [--module <path>]\n"
                "       [--user-dir <path>] [--title <text>]\n"
-               "       [--graphics <backend>] [--audio <backend>]\n"
+               "       [--graphics <backend|NativeGX|NativeD3D12|NativeD3D12Integrated>] [--audio <backend>]\n"
                "       [--wayland] [-X11] [--headless] [--allow-interpreter]\n"
+               "       [--run-seconds <positive seconds>]\n"
+               "       [--load-state <path>] [--save-state <path>]\n"
+               "       [--save-state-frame <XFB>] [--frame-offset <XFB>]\n"
+               "       [--stop-after-frame <XFB>]\n"
+               "       [--frame-interpolation off|replay|interpolate] (default: interpolate with\n"
+               "       NativeD3D12Integrated, otherwise off)\n"
+               "       [--internal-resolution <1..8>] (NativeGX: EFB at N x 640x528)\n"
+               "       [--window-size <width>x<height>]\n"
                "       With no --game, boots the path in <user-dir>/default-game.txt.\n";
 }
 
@@ -93,6 +104,9 @@ int main(int argc, char** argv)
   config.window_title = MODERNGEKKO_DEFAULT_WINDOW_TITLE;
 #endif
   std::filesystem::path module_path;
+  double run_seconds = 0;
+  std::optional<moderngekko::FrameInterpolationMode> frame_interpolation;
+  std::optional<int> internal_resolution;
   for (int i = 1; i < argc; ++i)
   {
     const std::string arg = argv[i];
@@ -114,12 +128,70 @@ int main(int argc, char** argv)
       config.window_title = value("--title");
     else if (arg == "--graphics")
       config.graphics.backend = value("--graphics");
+    else if (arg == "--internal-resolution")
+      internal_resolution = std::stoi(value("--internal-resolution"));
+    else if (arg == "--window-size")
+    {
+      const std::string size = value("--window-size");
+      const auto x = size.find('x');
+      if (x == std::string::npos)
+      {
+        std::cerr << "--window-size expects WIDTHxHEIGHT\n";
+        return 2;
+      }
+      config.graphics.window_width = std::stoi(size.substr(0, x));
+      config.graphics.window_height = std::stoi(size.substr(x + 1));
+    }
     else if (arg == "--audio")
       config.audio.backend = value("--audio");
+    else if (arg == "--load-state")
+      config.load_state = value("--load-state");
+    else if (arg == "--save-state")
+      config.save_state = value("--save-state");
+    else if (arg == "--save-state-frame" || arg == "--frame-offset" || arg == "--stop-after-frame")
+    {
+      const char* text = value(arg.c_str());
+      char* end = nullptr;
+      const auto frame = std::strtoull(text, &end, 10);
+      if (end == text || *end || *text == '-' || frame > 1000000000ULL)
+      {
+        std::cerr << arg << " requires a frame between 0 and 1000000000\n";
+        return 2;
+      }
+      if (arg == "--frame-offset") config.frame_offset = frame;
+      else if (arg == "--stop-after-frame") config.stop_after_frame = frame;
+      else config.save_state_frame = frame;
+    }
+    else if (arg == "--run-seconds")
+    {
+      const char* text = value("--run-seconds");
+      char* end = nullptr;
+      run_seconds = std::strtod(text, &end);
+      if (end == text || *end || !std::isfinite(run_seconds) || run_seconds <= 0)
+      {
+        std::cerr << "--run-seconds requires a positive finite number\n";
+        return 2;
+      }
+    }
     else if (arg == "-X11" || arg == "--x11")
       config.window_system = moderngekko::WindowSystem::X11;
     else if (arg == "--wayland")
       config.window_system = moderngekko::WindowSystem::Wayland;
+    else if (arg == "--frame-interpolation")
+    {
+      const std::string mode = value("--frame-interpolation");
+      if (mode == "off")
+        frame_interpolation = moderngekko::FrameInterpolationMode::Off;
+      else if (mode == "replay")
+        frame_interpolation = moderngekko::FrameInterpolationMode::Replay;
+      else if (mode == "interpolate")
+        frame_interpolation = moderngekko::FrameInterpolationMode::Interpolate;
+      else
+      {
+        std::cerr << "--frame-interpolation expects off, replay or interpolate\n";
+        return 2;
+      }
+    }
     else if (arg == "--headless")
       config.headless = true;
     else if (arg == "--allow-interpreter")
@@ -154,7 +226,10 @@ int main(int argc, char** argv)
     return 2;
   }
   config.graphics.internal_resolution_scale = frontend_config.dolphin_scale;
+  if (internal_resolution)
+    config.graphics.internal_resolution_scale = *internal_resolution;
   config.show_fps_in_title = frontend_config.show_fps_in_title;
+  if (config.graphics.backend.empty()) config.graphics.backend = frontend_config.graphics_backend;
 
   if (!frontend_config.controller.empty())
   {
@@ -209,22 +284,70 @@ int main(int argc, char** argv)
     config.graphics.backend = "Vulkan";
 #endif
 
+  std::unique_ptr<moderngekko::frontend::NativePresenter> native_presenter;
+  if (config.graphics.backend == "NativeGX")
+  {
+    // Native GX renderer (own D3D12 device) presents in the window; Dolphin
+    // keeps the command processor and timing with its Null video backend.
+    config.graphics.backend = "Null";
+    config.graphics.native_gx = true;
+    config.audio.backend = "No Audio Output";
+    std::cout << "graphics backend: NativeGX (native GX renderer)\n" << std::flush;
+    if (!frame_interpolation)
+      frame_interpolation = moderngekko::FrameInterpolationMode::Interpolate;
+  }
+  if (config.graphics.backend == "NativeD3D12Integrated")
+  {
+    // Share Dolphin's mature GX compatibility renderer with the StaticRecomp
+    // CPU. No capture bridge, second GX decoder, or companion renderer.
+    config.graphics.backend = "D3D12";
+    config.audio.backend = "No Audio Output";
+    std::cout << "graphics backend: NativeD3D12Integrated (shared GX D3D12 renderer)\n" << std::flush;
+    // 60 distinct images per second for this 30 Hz game by default.
+    if (!frame_interpolation)
+      frame_interpolation = moderngekko::FrameInterpolationMode::Interpolate;
+  }
+  config.frame_interpolation = frame_interpolation.value_or(moderngekko::FrameInterpolationMode::Off);
+  std::cout << "frame interpolation: "
+            << (config.frame_interpolation == moderngekko::FrameInterpolationMode::Interpolate ? "interpolate" :
+                config.frame_interpolation == moderngekko::FrameInterpolationMode::Replay ? "replay" : "off")
+            << '\n' << std::flush;
+  if (config.graphics.backend == "NativeD3D12")
+  {
+    native_presenter = std::make_unique<moderngekko::frontend::NativePresenter>();
+    std::string error;
+    if (!native_presenter->Start(ExecutableDirectory(argv[0]), config.user_directory,
+          config.window_title.value_or(inspected.metadata->game_name), config.show_fps_in_title, config.headless, error))
+    { std::cerr << "native graphics initialization failed: " << error << '\n'; return 1; }
+    config.headless = true; // The companion owns the visible D3D12 window.
+    config.graphics.backend = "Null";
+    config.graphics.external_presentation = true;
+    std::cout << "graphics backend: NativeD3D12\nnative renderer log: " << native_presenter->LogPath()
+              << "\nnative renderer pid: " << native_presenter->ProcessId() << '\n' << std::flush;
+  }
   auto created = moderngekko::Runtime::Create(std::move(config));
   if (!created)
   {
     std::cerr << "initialization failed: " << created.error->message << '\n';
     return 1;
   }
-  std::cout << "audio backend: " << created.runtime->GetConfig().audio.backend << '\n';
+  std::cout << "audio backend: " << created.runtime->GetConfig().audio.backend << '\n' << std::flush;
 
   std::signal(SIGINT, HandleStopSignal);
   std::signal(SIGTERM, HandleStopSignal);
+  const auto run_start = std::chrono::steady_clock::now();
   std::jthread signal_watcher([&](std::stop_token stop_token) {
     while (!stop_token.stop_requested())
     {
-      if (s_stop_requested)
+      if (s_stop_requested || (run_seconds > 0 &&
+          std::chrono::duration<double>(std::chrono::steady_clock::now() - run_start).count() >= run_seconds))
       {
         s_stop_requested = 0;
+        created.runtime->RequestStop();
+        return;
+      }
+      if (native_presenter && native_presenter->ExitCode())
+      {
         created.runtime->RequestStop();
         return;
       }
@@ -233,6 +356,12 @@ int main(int argc, char** argv)
   });
   const moderngekko::RuntimeRunResult result = created.runtime->Run();
   signal_watcher.request_stop();
+  signal_watcher.join();
+  if (native_presenter && native_presenter->ExitCode().value_or(0) != 0)
+  {
+    std::cerr << "native renderer failed; inspect " << native_presenter->LogPath() << '\n';
+    return 1;
+  }
   if (result.error)
   {
     std::cerr << "runtime failed: " << result.error->message << '\n';

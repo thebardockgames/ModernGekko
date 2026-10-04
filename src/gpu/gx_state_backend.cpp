@@ -4,6 +4,7 @@
 #include "moderngekko/gx_state_backend.hpp"
 
 #include <algorithm>
+#include <chrono>
 
 namespace moderngekko
 {
@@ -18,14 +19,19 @@ void GxStateBackend::SetRenderDevice(GxRenderDevice* device)
 
 void GxStateBackend::Reset()
 {
+  ++m_generation;
   m_cp = {};
   m_xf = {};
   m_bp = {};
+  m_tev_colors = {};
+  m_tev_konst = {};
+  std::ranges::fill(m_texture_memory, 0);
   m_bp_mask = 0xFFFFFFu;
 }
 
 void GxStateBackend::LoadCpRegister(std::uint8_t command, std::uint32_t value)
 {
+  if (m_cp[command] != value) ++m_generation;
   m_cp[command] = value;
 }
 
@@ -35,6 +41,7 @@ void GxStateBackend::LoadXfRegisters(std::uint16_t address,
   if (address >= m_xf.size())
     return;
   const std::size_t count = std::min(values.size(), m_xf.size() - address);
+  if (!std::ranges::equal(values.first(count), std::span(m_xf).subspan(address, count))) ++m_generation;
   std::ranges::copy(values.first(count), m_xf.begin() + address);
 }
 
@@ -48,8 +55,26 @@ void GxStateBackend::LoadBpRegister(std::uint8_t command, std::uint32_t value)
     return;
   }
 
-  m_bp[command] = (m_bp[command] & ~m_bp_mask) | (value & m_bp_mask);
+  const auto next = (m_bp[command] & ~m_bp_mask) | (value & m_bp_mask);
+  if (next != m_bp[command] || command == 0x65u || command == 0x66u) ++m_generation;
+  m_bp[command] = next;
+  if (command >= 0xE0u && command <= 0xE7u)
+  {
+    auto& bank = (m_bp[command] & (1u << 23)) ? m_tev_konst : m_tev_colors;
+    bank[command - 0xE0u] = m_bp[command];
+  }
   m_bp_mask = 0xFFFFFFu;
+  if (command == 0x66u && m_device)
+    m_device->InvalidateTextures();
+  if (command == 0x65u)
+  {
+    const auto destination = (m_bp[0x65u] & 0x3FFu) << 9;
+    const auto bytes = ((m_bp[0x65u] >> 10) & 0x7FFu) * 32u;
+    const auto source = m_bp[0x64u] << 5;
+    if (destination + bytes <= m_texture_memory.size())
+      if (const auto* data = m_memory.Resolve(source, bytes))
+        std::copy_n(data, bytes, m_texture_memory.begin() + destination);
+  }
   if (command == 0x52u && m_device)
   {
     const std::uint32_t source = m_bp[0x49u];
@@ -60,15 +85,15 @@ void GxStateBackend::LoadBpRegister(std::uint8_t command, std::uint32_t value)
     std::array<std::uint8_t, 7> coefficients{};
     for (std::size_t i = 0; i < coefficients.size(); ++i)
       coefficients[i] = static_cast<std::uint8_t>((filter >> (i * 6u)) & 0x3Fu);
-    const std::uint32_t clear_color = ((m_bp[0x4Fu] >> 8u) & 0xFFu) << 24u |
-                                      (m_bp[0x50u] & 0xFFu) << 16u |
-                                      ((m_bp[0x50u] >> 8u) & 0xFFu) << 8u |
-                                      (m_bp[0x4Fu] & 0xFFu);
+    const std::uint32_t clear_color = (m_bp[0x4Fu] & 0xFFu) << 24u |
+                                      ((m_bp[0x50u] >> 8u) & 0xFFu) << 16u |
+                                      (m_bp[0x50u] & 0xFFu) << 8u |
+                                      ((m_bp[0x4Fu] >> 8u) & 0xFFu);
     m_device->CopyEfb({
-        static_cast<std::uint16_t>((source >> 10) & 0x3FFu),
         static_cast<std::uint16_t>(source & 0x3FFu),
-        static_cast<std::uint16_t>(((dimensions >> 10) & 0x3FFu) + 1u),
+        static_cast<std::uint16_t>((source >> 10) & 0x3FFu),
         static_cast<std::uint16_t>((dimensions & 0x3FFu) + 1u),
+        static_cast<std::uint16_t>(((dimensions >> 10) & 0x3FFu) + 1u),
         (m_bp[0x4Bu] & 0xFFFFFFu) << 5,
         (m_bp[0x4Du] & 0xFFFFFFu) << 5,
         m_bp[0x4Eu] & 0xFFFFFFu,
@@ -86,6 +111,8 @@ void GxStateBackend::LoadBpRegister(std::uint8_t command, std::uint32_t value)
         (control & (1u << 14)) != 0u,
         (control & (1u << 15)) != 0u,
         (control & (1u << 16)) != 0u,
+        (m_bp[0x43] & 7u) == 3u, // PixelFormat::Z24
+        static_cast<std::uint8_t>(((m_bp[0x41] >> 3) & 3u) | ((m_bp[0x40] & 16u) ? 4u : 0u)),
     });
   }
 }
@@ -108,16 +135,21 @@ void GxStateBackend::LoadIndexedXf(std::uint8_t array, std::uint16_t index,
     std::uint32_t value = 0;
     if (!m_memory.Read32(static_cast<std::uint32_t>(source_address) + i * 4u, &value))
       break;
+    if (m_xf[address + i] != value) ++m_generation;
     m_xf[address + i] = value;
   }
 }
 
 void GxStateBackend::Draw(const GxDrawPacket& packet)
 {
-  if (m_device)
+  if (m_device && m_device->WantsDecodedDraws())
   {
-    GxDecodedDraw decoded;
-    if (m_vertex_loader.Decode(packet, m_cp, &decoded))
+    auto& decoded = m_decoded_draw;
+    const bool profile = m_device->WantsCpuProfiling();
+    const auto start = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    const bool success = m_vertex_loader.Decode(packet, m_cp, &decoded);
+    if (profile) m_device->RecordVertexDecode(std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count());
+    if (success)
       m_device->SubmitDecodedDraw(packet, decoded, GetState());
     else
       m_device->SubmitDraw(packet, GetState());
@@ -138,6 +170,6 @@ void GxStateBackend::PresentXfb(const GxXfbPresent& present)
 
 GxStateView GxStateBackend::GetState() const
 {
-  return {m_cp, m_xf, m_bp};
+  return {m_cp, m_xf, m_bp, m_tev_colors, m_tev_konst, m_texture_memory, m_generation};
 }
 }

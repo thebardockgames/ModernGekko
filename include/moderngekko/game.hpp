@@ -33,6 +33,7 @@ struct GameInspectResult
 };
 
 GameInspectResult InspectGame(const std::filesystem::path& root);
+std::optional<std::string> Sha256File(const std::filesystem::path& path);
 }  // namespace moderngekko
 
 namespace ModernGekko = moderngekko;

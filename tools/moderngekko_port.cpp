@@ -27,6 +27,9 @@ struct BuildOptions
 {
   std::string toolchain = "auto";
   fs::path output;
+  fs::path recompile_dol;
+  fs::path native_hooks;  // guest functions the runtime may replace (DolRecomp --native-hooks)
+  unsigned jobs = 0;      // module compile jobs (0: default)
   std::vector<std::string> runner_arguments;
 };
 
@@ -190,6 +193,13 @@ std::optional<fs::path> Build(const char* argv0, const fs::path& root,
     return std::nullopt;
   }
   const auto& game = *inspected.metadata;
+  const fs::path recompile_dol = options.recompile_dol.empty() ? game.main_dol : options.recompile_dol;
+  const auto recompile_hash = moderngekko::Sha256File(recompile_dol);
+  if (!recompile_hash)
+  {
+    std::cerr << "cannot fingerprint recompilation DOL: " << recompile_dol << '\n';
+    return std::nullopt;
+  }
   if (options.output.empty())
     options.output = DefaultOutput();
 
@@ -249,11 +259,59 @@ std::optional<fs::path> Build(const char* argv0, const fs::path& root,
   {
     flags = "compile:/O2 /fp:strict";
   }
+  const fs::path source_root = fs::path(MODERNGEKKO_SOURCE_DIR);
+  const fs::path dolrecomp = SiblingExecutable(argv0, "dolrecomp");
+  const auto generator_hash = moderngekko::Sha256File(dolrecomp);
+  if (!generator_hash)
+  {
+    std::cerr << "cannot fingerprint DolRecomp executable: " << dolrecomp << '\n';
+    return std::nullopt;
+  }
+  // Revision labels do not capture uncommitted source changes. Fingerprint
+  // the real generator and module runtime so stale emitted code cannot hit.
+  std::vector<fs::path> dependencies;
+  for (const auto& directory : {source_root / "vendor/dolphin/module-template",
+                               source_root / "vendor/dolphin/GXRuntime/include/core",
+                               source_root / "vendor/dolphin/GXRuntime/include/cpu",
+                               source_root / "vendor/dolphin/GXRuntime/src/core"})
+  {
+    for (const auto& file : fs::directory_iterator(directory))
+      if (file.is_regular_file() && (file.path().extension() == ".h" ||
+          file.path().extension() == ".c" || file.path().extension() == ".py" ||
+          file.path().filename() == "CMakeLists.txt"))
+        dependencies.push_back(file.path());
+  }
+  dependencies.push_back(source_root / "vendor/dolphin/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompABI.h");
+  std::sort(dependencies.begin(), dependencies.end());
+  std::string runtime_identity;
+  for (const auto& file : dependencies)
+  {
+    const auto hash = moderngekko::Sha256File(file);
+    if (!hash)
+    {
+      std::cerr << "cannot fingerprint module dependency: " << file << '\n';
+      return std::nullopt;
+    }
+    runtime_identity += file.lexically_relative(source_root).generic_string() + ':' + *hash + ';';
+  }
+  std::string native_hooks_hash = "none";
+  if (!options.native_hooks.empty())
+  {
+    const auto hash = moderngekko::Sha256File(options.native_hooks);
+    if (!hash)
+    {
+      std::cerr << "cannot fingerprint native hook list: " << options.native_hooks << '\n';
+      return std::nullopt;
+    }
+    native_hooks_hash = *hash;
+  }
   const std::string identity = std::string(RECOMPCORE_REVISION) + "|dolrecomp=" +
       std::string(DOLRECOMP_REVISION) + "|module-abi=" +
       std::to_string(MODERNGEKKO_MODULE_ABI_VERSION) + "|cpu-abi=" +
       std::to_string(MODERNGEKKO_CPU_ABI_VERSION) + "|" + compiler_identity + "|" +
-      std::string(architecture) + "|" + flags;
+      std::string(architecture) + "|" + flags + "|generator-sha256=" + *generator_hash +
+      "|module-runtime=" + runtime_identity + "|recompile-dol=" + *recompile_hash +
+      (options.native_hooks.empty() ? std::string() : "|native-hooks=" + native_hooks_hash);
   std::ostringstream key_tail;
   key_tail << std::hex << std::setfill('0') << std::setw(16) << Fnv1a(identity);
   const std::string cache_key = game.dol_sha256 + "-" + key_tail.str();
@@ -275,8 +333,11 @@ std::optional<fs::path> Build(const char* argv0, const fs::path& root,
     fs::copy_file(built, module, fs::copy_options::overwrite_existing);
     std::ofstream manifest(artifact / "manifest.txt");
     manifest << "disc_id=" << game.disc_id << '\n' << "dol_sha256=" << game.dol_sha256 << '\n'
+             << "recompile_dol_sha256=" << *recompile_hash << '\n'
+             << "native_hooks_sha256=" << native_hooks_hash << '\n'
              << "recompcore_revision=" << RECOMPCORE_REVISION << '\n'
              << "dolrecomp_revision=" << DOLRECOMP_REVISION << '\n'
+             << "dolrecomp_executable_sha256=" << *generator_hash << '\n'
              << "module_abi=" << MODERNGEKKO_MODULE_ABI_VERSION << '\n'
              << "cpu_abi=" << MODERNGEKKO_CPU_ABI_VERSION << '\n'
              << "compiler=" << compiler_identity << '\n'
@@ -292,14 +353,22 @@ std::optional<fs::path> Build(const char* argv0, const fs::path& root,
     return publish_module();
 
   fs::create_directories(artifact);
+  const fs::path frozen_dol = artifact / "recompile-input.dol";
+  fs::copy_file(recompile_dol, frozen_dol, fs::copy_options::overwrite_existing);
+  if (moderngekko::Sha256File(frozen_dol) != recompile_hash)
+  {
+    std::cerr << "recompilation input changed during snapshot\n";
+    return std::nullopt;
+  }
   const fs::path generated_parent = artifact / "dolrecomp-output";
-  const fs::path dolrecomp = SiblingExecutable(argv0, "dolrecomp");
   std::string generate = Quote(dolrecomp) + " -j" +
                          std::to_string(std::max(1u, std::thread::hardware_concurrency())) + " ";
+  if (!options.native_hooks.empty())
+    generate += "--native-hooks " + Quote(options.native_hooks) + " ";
   if (game.platform == moderngekko::GamePlatform::GameCube)
-    generate += "--cpu gekko --gamecube " + Quote(game.main_dol) + " " + Quote(generated_parent);
+    generate += "--cpu gekko --gamecube " + Quote(frozen_dol) + " " + Quote(generated_parent);
   else
-    generate += "--cpu broadway " + Quote(game.main_dol) + " " + game.disc_id + " " +
+    generate += "--cpu broadway " + Quote(frozen_dol) + " " + game.disc_id + " " +
                 Quote(generated_parent);
   if (!RunCommand(generate))
     return std::nullopt;
@@ -324,7 +393,7 @@ std::optional<fs::path> Build(const char* argv0, const fs::path& root,
   }
   if (emitted_header.filename() != "generated.h")
     fs::copy_file(emitted_header, generated / "generated.h", fs::copy_options::overwrite_existing);
-  fs::copy_file(game.main_dol, generated / "main.dol", fs::copy_options::overwrite_existing);
+  fs::copy_file(frozen_dol, generated / "main.dol", fs::copy_options::overwrite_existing);
   const fs::path emitted_smc = generated / (generated_stem + "_smc.txt");
   const fs::path normalized_smc = generated / "generated_smc.txt";
   if (fs::is_regular_file(emitted_smc))
@@ -335,19 +404,22 @@ std::optional<fs::path> Build(const char* argv0, const fs::path& root,
   else
     std::ofstream{normalized_smc};
 
-  const fs::path source_root = fs::path(MODERNGEKKO_SOURCE_DIR);
-  const unsigned compile_jobs =
-      std::min(8u, std::max(1u, std::thread::hardware_concurrency()));
-  std::string configure = "cmake -E env CMAKE_NINJA_FORCE_RESPONSE_FILE=1 cmake -S " +
+  // Generated chunks are large; default to two compilers, --jobs raises it
+  // when the machine has the memory.
+  const unsigned compile_jobs = options.jobs ? options.jobs :
+      std::min(2u, std::max(1u, std::thread::hardware_concurrency()));
+  const std::string cmake = Quote(fs::path(MODERNGEKKO_CMAKE_EXECUTABLE));
+  std::string configure = cmake + " -E env CMAKE_NINJA_FORCE_RESPONSE_FILE=1 " + cmake + " -S " +
       Quote(source_root / "vendor/dolphin/module-template") +
       " -B " + Quote(module_build) + " -G Ninja -DCMAKE_BUILD_TYPE=Release" +
+      " -DCMAKE_MAKE_PROGRAM=" + Quote(fs::path(MODERNGEKKO_NINJA_EXECUTABLE)) +
       " -DCMAKE_C_COMPILER=" + compiler + " -DGAME_ID=" + game.disc_id +
       " -DGENERATED_DIR=" + Quote(generated) +
       " -DGXRUNTIME_DIR=" + Quote(source_root / "vendor/dolphin/GXRuntime") +
       " -DCHASSIS_ABI_DIR=" +
       Quote(source_root / "vendor/dolphin/Source/Core/Core/PowerPC/StaticRecomp");
   if (!RunCommand(configure) ||
-      !RunCommand("cmake --build " + Quote(module_build) + " -j" +
+      !RunCommand(cmake + " --build " + Quote(module_build) + " -j" +
                   std::to_string(compile_jobs)))
     return std::nullopt;
 
@@ -362,7 +434,7 @@ std::optional<fs::path> Build(const char* argv0, const fs::path& root,
 void Usage()
 {
   std::cerr << "usage: moderngekko-port inspect <game-root>\n"
-               "       moderngekko-port build <game-root> [--toolchain auto|clang|gcc|msvc] [--output path]\n"
+               "       moderngekko-port build <game-root> [--toolchain auto|clang|gcc|msvc] [--output path] [--recompile-dol path] [--native-hooks list] [--jobs N]\n"
                "       moderngekko-port run <game-root> [build options] [-- runner options]\n";
 }
 }  // namespace
@@ -389,6 +461,12 @@ int main(int argc, char** argv)
       options.toolchain = argv[++i];
     else if (arg == "--output" && i + 1 < argc)
       options.output = argv[++i];
+    else if (arg == "--recompile-dol" && i + 1 < argc)
+      options.recompile_dol = argv[++i];
+    else if (arg == "--native-hooks" && i + 1 < argc)
+      options.native_hooks = argv[++i];
+    else if (arg == "--jobs" && i + 1 < argc)
+      options.jobs = static_cast<unsigned>(std::stoul(argv[++i]));
     else if (command == "run")
       options.runner_arguments.push_back(arg);
     else

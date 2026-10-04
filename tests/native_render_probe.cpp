@@ -6,6 +6,9 @@
 // shader source for real game state -- not synthetic/test state.
 #include "moderngekko/dolphin_shader_compiler.hpp"
 #include "moderngekko/glsl_to_hlsl.hpp"
+#include "moderngekko/gx_live_frame.hpp"
+#include <fstream>
+#include <iterator>
 
 #include <array>
 #include <cstdio>
@@ -87,6 +90,12 @@ bool CompileViaRealPipeline(const std::string& source, moderngekko::GlslShaderKi
   }
   std::printf("--- %s: cross-compiled HLSL (first 300 chars) ---\n%.300s\n...\n", label,
               hlsl->c_str());
+  if (const char* prefix = std::getenv("MODERNGEKKO_PROBE_SHADER_OUTPUT"))
+  {
+    std::ofstream output(std::string(prefix) + (kind == moderngekko::GlslShaderKind::Vertex ? ".vs.hlsl" : ".ps.hlsl"));
+    output << *hlsl;
+    if (!output) return false;
+  }
   return CompileHlsl(*hlsl, entry, target);
 }
 }
@@ -119,8 +128,20 @@ int main()
   }
 
   std::fprintf(stderr, "calling Compile...\n"); std::fflush(stderr);
+  std::array<std::uint32_t,16> tev{};
+  moderngekko::DolphinShaderCapabilities capabilities;
+  if (const char* packet_path = std::getenv("MODERNGEKKO_PROBE_PACKET"))
+  {
+    std::ifstream input(packet_path,std::ios::binary);
+    std::vector<std::uint8_t> bytes((std::istreambuf_iterator<char>(input)),{});
+    const auto frame = moderngekko::DecodeGxLiveFrame(bytes);
+    const char* state_index = std::getenv("MODERNGEKKO_PROBE_PACKET_STATE");
+    const auto& state = frame.states.at(state_index ? std::stoul(state_index) : 0);
+    cp = state.cp; xf = state.xf; bp = state.bp; tev = state.tev;
+    capabilities.reversed_depth_range = false;
+  }
   const moderngekko::DolphinShaderBundle shaders = moderngekko::DolphinShaderCompiler::Compile(
-      {cp, xf, bp}, moderngekko::GxTopology::Triangles, 0, moderngekko::DolphinShaderApi::D3d);
+      {cp, xf, bp, std::span(tev).first(8),std::span(tev).subspan(8)}, moderngekko::GxTopology::Triangles, 0, moderngekko::DolphinShaderApi::D3d,capabilities);
   std::fprintf(stderr, "Compile returned\n"); std::fflush(stderr);
 
   if (shaders.vertex.empty() || shaders.pixel.empty())

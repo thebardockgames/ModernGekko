@@ -141,5 +141,25 @@ int main()
   {
     return 7;
   }
+  // Verify every GX fixed-point fraction and integer format against the
+  // mathematical power-of-two conversion, including signed extrema.
+  for (unsigned format = 0; format < 4; ++format)
+    for (unsigned fraction = 0; fraction < 32; ++fraction)
+    {
+      cp = {}; cp[0x50] = 1u << 9; cp[0x70] = (format << 1) | (fraction << 4);
+      const std::array<std::uint8_t, 4> bytes = format < 2 ?
+          std::array<std::uint8_t, 4>{0x80, 0x7F, 0, 0} :
+          std::array<std::uint8_t, 4>{0x80, 0, 0x7F, 0xFF};
+      const auto size = format < 2 ? 2u : 4u;
+      const moderngekko::GxDrawPacket scaled = {
+          moderngekko::GxPrimitive::Points, 0u, size, 1u, std::span(bytes).first(size)};
+      if (!loader.Decode(scaled, cp, &decoded) || decoded.vertices.size() != 1) return 8;
+      const std::array<float, 2> values = format == 0 ? std::array<float, 2>{128, 127} :
+          format == 1 ? std::array<float, 2>{-128, 127} :
+          format == 2 ? std::array<float, 2>{32768, 32767} : std::array<float, 2>{-32768, 32767};
+      for (unsigned component = 0; component < 2; ++component)
+        if (std::bit_cast<std::uint32_t>(decoded.vertices[0].position[component]) !=
+            std::bit_cast<std::uint32_t>(std::ldexp(values[component], -static_cast<int>(fraction)))) return 9;
+    }
   return 0;
 }

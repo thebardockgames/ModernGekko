@@ -39,6 +39,8 @@ struct GxDecodedTexture
 class GxTextureDecoder final
 {
 public:
+  // Packed pixels are 0xRRGGBBAA; GPU uploads require explicit RGBA byte order.
+  static std::vector<std::uint8_t> ToRgba8Bytes(std::span<const std::uint32_t> pixels);
   static std::size_t EncodedSize(std::uint32_t width, std::uint32_t height,
                                  GxTextureFormat format);
   static std::size_t PaletteEntries(GxTextureFormat format);

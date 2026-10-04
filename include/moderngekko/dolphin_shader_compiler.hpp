@@ -45,6 +45,8 @@ struct DolphinShaderCapabilities
 
 struct DolphinShaderOptions
 {
+  // Offline inspection needs all variants; the live specialized pipeline does not.
+  bool generate_auxiliary_shaders = true;
   bool fast_depth = true;
   bool pixel_lighting = false;
   bool force_true_color = false;
@@ -61,6 +63,10 @@ struct DolphinShaderOptions
 
 struct DolphinShaderBundle
 {
+  // Generated RenderState words, separate from shader uniforms.
+  std::uint32_t blend_state = 0;
+  std::uint32_t depth_state = 0;
+  std::uint32_t raster_state = 0;
   std::string vertex;
   std::string pixel;
   std::string geometry;
@@ -81,6 +87,8 @@ struct DolphinShaderBundle
   // PixelShaderGen.cpp's UBO declaration), so the render side can memcpy
   // this directly once it confirms the reflected cbuffer size matches.
   std::vector<std::uint8_t> pixel_constants;
+  // Native-resolution VSBlock, including captured transforms/projection.
+  std::vector<std::uint8_t> vertex_constants;
 };
 
 class DolphinShaderCompiler final

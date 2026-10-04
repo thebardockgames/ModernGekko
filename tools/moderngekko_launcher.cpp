@@ -372,6 +372,7 @@ int main(int argc, char** argv)
   auto current_metadata = moderngekko::InspectGame(current_game);
   const auto& resolutions = moderngekko::frontend::SupportedResolutions();
   bool show_fps_in_title = config.show_fps_in_title;
+  std::string graphics_backend = config.graphics_backend;
   int resolution_index = 0;
   for (std::size_t i = 0; i < resolutions.size(); ++i)
   {
@@ -398,7 +399,7 @@ int main(int argc, char** argv)
     std::string error;
     if (!moderngekko::frontend::SaveConfig(user_directory,
                                            resolutions[resolution_index].text,
-                                           show_fps_in_title, controllers[index].device, &error))
+                                           show_fps_in_title, controllers[index].device, &error, graphics_backend))
     {
       std::lock_guard lock(dialog.mutex);
       dialog.error = std::move(error);
@@ -512,6 +513,23 @@ int main(int argc, char** argv)
     }
 
     ImGui::Spacing();
+    if (ImGui::BeginCombo("Graphics", graphics_backend.empty() ? "Dolphin" : "Native D3D12 (experimental)"))
+    {
+      for (const auto& backend : {std::string{}, std::string{"NativeD3D12"}})
+      {
+        if (ImGui::Selectable(backend.empty() ? "Dolphin" : "Native D3D12 (experimental)", graphics_backend == backend))
+        {
+          std::string error;
+          if (moderngekko::frontend::SaveConfig(user_directory, resolutions[resolution_index].text,
+                  show_fps_in_title, selected_controller, &error, backend))
+            graphics_backend = backend;
+          else { std::lock_guard lock(dialog.mutex); dialog.error = std::move(error); }
+        }
+      }
+      ImGui::EndCombo();
+    }
+    if (!graphics_backend.empty()) ImGui::TextUnformatted("Native output: 640x480");
+    ImGui::BeginDisabled(!graphics_backend.empty());
     ImGui::TextUnformatted("Internal resolution (Dolphin EFB upscale)");
     if (ImGui::BeginCombo("##resolution", resolutions[resolution_index].text))
     {
@@ -522,7 +540,7 @@ int main(int argc, char** argv)
         {
           std::string error;
           if (moderngekko::frontend::SaveConfig(user_directory, resolutions[i].text,
-                                                show_fps_in_title, selected_controller, &error))
+                                                show_fps_in_title, selected_controller, &error, graphics_backend))
             resolution_index = static_cast<int>(i);
           else
           {
@@ -533,13 +551,14 @@ int main(int argc, char** argv)
       }
       ImGui::EndCombo();
     }
+    ImGui::EndDisabled();
     const bool previous_show_fps_in_title = show_fps_in_title;
     if (ImGui::Checkbox("Show FPS in window title", &show_fps_in_title))
     {
       std::string error;
       if (!moderngekko::frontend::SaveConfig(user_directory,
                                              resolutions[resolution_index].text,
-                                             show_fps_in_title, selected_controller, &error))
+                                             show_fps_in_title, selected_controller, &error, graphics_backend))
       {
         show_fps_in_title = previous_show_fps_in_title;
         std::lock_guard lock(dialog.mutex);

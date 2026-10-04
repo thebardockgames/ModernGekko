@@ -37,5 +37,14 @@ int main()
   if (!memory.Read32(0x80000100u, &value32) || value32 != 0u)
     return 9;
 
+  std::vector<std::uint8_t> external1(32), external2(32);
+  moderngekko::AddressSpace borrowed(std::size_t{0}, std::size_t{0});
+  borrowed.BindExternalMemory(external1, external2);
+  borrowed.Write32(0x80000000u, 0x11223344u);
+  external2[0] = 0xAB;
+  const auto& reader = borrowed;
+  std::uint8_t byte = 0;
+  if (external1[0] != 0x11 || !reader.Read8(0xD0000000u, &byte) || byte != 0xAB ||
+      reader.Resolve(0x8000001Fu, 2) != nullptr) return 10;
   return 0;
 }

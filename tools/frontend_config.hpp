@@ -19,6 +19,7 @@ struct ConfigResult
   std::string resolution;
   std::string controller;
   bool show_fps_in_title = true;
+  std::string graphics_backend;
   std::string error;
 
   explicit operator bool() const { return error.empty(); }
@@ -27,7 +28,8 @@ struct ConfigResult
 const std::vector<ResolutionOption>& SupportedResolutions();
 ConfigResult LoadConfig(const std::filesystem::path& user_directory, bool create_if_missing);
 bool SaveConfig(const std::filesystem::path& user_directory, std::string_view resolution,
-                bool show_fps_in_title, std::string_view controller, std::string* error);
+                bool show_fps_in_title, std::string_view controller, std::string* error,
+                std::string_view graphics_backend = {});
 std::string ReadConfiguredController(const std::filesystem::path& user_directory);
 bool GenerateControllerConfig(const std::filesystem::path& user_directory,
                               std::string_view controller, std::string* message);

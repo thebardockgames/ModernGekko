@@ -125,6 +125,20 @@ void DecodeCmprSubBlock(const std::uint8_t* source, std::uint32_t base_x,
 }
 }
 
+std::vector<std::uint8_t> GxTextureDecoder::ToRgba8Bytes(std::span<const std::uint32_t> pixels)
+{
+  std::vector<std::uint8_t> bytes;
+  bytes.reserve(pixels.size() * 4);
+  for (const auto pixel : pixels)
+  {
+    bytes.push_back(static_cast<std::uint8_t>(pixel >> 24));
+    bytes.push_back(static_cast<std::uint8_t>(pixel >> 16));
+    bytes.push_back(static_cast<std::uint8_t>(pixel >> 8));
+    bytes.push_back(static_cast<std::uint8_t>(pixel));
+  }
+  return bytes;
+}
+
 std::size_t GxTextureDecoder::EncodedSize(std::uint32_t width, std::uint32_t height,
                                           GxTextureFormat format)
 {

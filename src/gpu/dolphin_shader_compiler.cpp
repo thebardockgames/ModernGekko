@@ -14,9 +14,11 @@
 #include "VideoCommon/XFMemory.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstring>
 #include <mutex>
 #include <span>
+#include <unordered_map>
 
 namespace moderngekko
 {
@@ -25,6 +27,127 @@ void SetDolphinShaderCacheDirectory(std::string directory);
 namespace
 {
 std::mutex s_shader_mutex;
+
+// Shader UIDs describe source code; matrices, colors and texture dimensions
+// belong to constants and must still be rebuilt for every material.
+struct SourceEntry { std::string source; std::uint64_t used; };
+std::unordered_map<std::string, SourceEntry> s_sources;
+std::size_t s_source_bytes = 0;
+std::uint64_t s_source_clock = 0;
+template <typename Uid, typename Generate>
+std::string CachedSource(APIType api, ShaderHostConfig host, std::uint32_t extra_caps, unsigned stage,
+                         const Uid& uid, Generate generate)
+{
+  const std::uint32_t header[]{static_cast<std::uint32_t>(api), host.bits, extra_caps, stage};
+  std::string key(reinterpret_cast<const char*>(header), sizeof(header));
+  key.append(reinterpret_cast<const char*>(uid.GetUidDataRaw()), uid.GetUidDataSize());
+  if (auto found = s_sources.find(key); found != s_sources.end())
+  { found->second.used = ++s_source_clock; return found->second.source; }
+  auto source = generate();
+  const auto bytes = key.size() + source.size();
+  while (!s_sources.empty() && (s_sources.size() >= 1024 || s_source_bytes + bytes > 64 * 1024 * 1024))
+  {
+    const auto oldest = std::min_element(s_sources.begin(), s_sources.end(),
+        [](const auto& a, const auto& b) { return a.second.used < b.second.used; });
+    s_source_bytes -= oldest->first.size() + oldest->second.source.size();
+    s_sources.erase(oldest);
+  }
+  if (bytes <= 64 * 1024 * 1024)
+  { s_source_bytes += bytes; s_sources.emplace(std::move(key), SourceEntry{source, ++s_source_clock}); }
+  return source;
+}
+
+// Offline counterpart of VertexShaderManager::SetConstants at native EFB
+// resolution. No framebuffer manager, free-look camera or graphics mods.
+std::vector<std::uint8_t> BuildRealVertexConstants(const GxStateView& state)
+{
+  VertexShaderConstants c{};
+  c.components = VertexLoaderManager::g_current_components;
+  c.missing_color_value = {1, 1, 1, 1};
+  c.xfmem_dualTexInfo = xfmem.dualTexTrans.enabled;
+  c.xfmem_numColorChans = xfmem.numChan.numColorChans;
+  std::memcpy(c.transformmatrices.data(), xfmem.posMatrices, sizeof(xfmem.posMatrices));
+  std::memcpy(c.posttransformmatrices.data(), xfmem.postMatrices, sizeof(xfmem.postMatrices));
+  for (std::size_t i = 0; i < 32; ++i)
+    std::memcpy(c.normalmatrices[i].data(), xfmem.normalMatrices + 3 * i, 3 * sizeof(float));
+  const u32 index_a = state.cp.size() > 0x30 ? state.cp[0x30] : xfmem.MatrixIndexA.Hex;
+  const u32 index_b = state.cp.size() > 0x40 ? state.cp[0x40] : xfmem.MatrixIndexB.Hex;
+  const u32 pos_index = index_a & 63;
+  // Matrix indices identify rows; a complete 3-row matrix must fit in XF.
+  if (pos_index <= 61)
+    std::memcpy(c.posnormalmatrix.data(), xfmem.posMatrices + pos_index * 4, 12 * sizeof(float));
+  const u32 normal_index = pos_index & 31;
+  if (normal_index <= 29)
+    for (u32 row = 0; row < 3; ++row)
+      std::memcpy(c.posnormalmatrix[3 + row].data(), xfmem.normalMatrices + (normal_index + row) * 3, 3 * sizeof(float));
+  for (u32 unit = 0; unit < 8; ++unit)
+  {
+    const u32 index = unit < 4 ? (index_a >> (6 * (unit + 1))) & 63 : (index_b >> (6 * (unit - 4))) & 63;
+    if (index <= 61)
+      std::memcpy(c.texmatrices[unit * 3].data(), xfmem.posMatrices + index * 4, 12 * sizeof(float));
+    c.xfmem_pack1[unit][0] = xfmem.texMtxInfo[unit].hex;
+    c.xfmem_pack1[unit][1] = xfmem.postMtxInfo[unit].hex;
+  }
+  for (u32 i = 0; i < 4; ++i)
+  {
+    const u32 rgba = i < 2 ? xfmem.ambColor[i] : xfmem.matColor[i - 2];
+    for (u32 channel = 0; channel < 4; ++channel)
+      c.materials[i][channel] = (rgba >> (24 - 8 * channel)) & 255;
+  }
+  for (u32 i = 0; i < 2; ++i)
+  {
+    c.xfmem_pack1[i][2] = xfmem.color[i].hex;
+    c.xfmem_pack1[i][3] = xfmem.alpha[i].hex;
+  }
+  for (u32 i = 0; i < 8; ++i)
+  {
+    const auto& light = xfmem.lights[i];
+    auto& dst = c.lights[i];
+    double length2 = 0;
+    for (u32 channel = 0; channel < 3; ++channel)
+      length2 += static_cast<double>(light.ddir[channel]) * light.ddir[channel];
+    const double inverse = length2 > 0 ? 1.0 / std::sqrt(length2) : 0;
+    for (u32 channel = 0; channel < 4; ++channel)
+      dst.color[channel] = light.color[3 - channel];
+    for (u32 channel = 0; channel < 3; ++channel)
+    {
+      dst.cosatt[channel] = light.cosatt[channel];
+      dst.distatt[channel] = light.distatt[channel];
+      dst.pos[channel] = light.dpos[channel];
+      const float direction = static_cast<float>(light.ddir[channel] * inverse);
+      dst.dir[channel] = std::isfinite(direction) ? direction : 0;
+    }
+    if (std::fabs(dst.distatt[0]) < 0.00001f && std::fabs(dst.distatt[1]) < 0.00001f && std::fabs(dst.distatt[2]) < 0.00001f)
+      dst.distatt[0] = 0.00001f;
+  }
+  const auto& p = xfmem.projection.rawProjection;
+  if (xfmem.projection.type == ProjectionType::Perspective)
+  {
+    c.projection[0] = {p[0], 0, p[1], 0};
+    c.projection[1] = {0, p[2], p[3], 0};
+    c.projection[2] = {0, 0, p[4], p[5]};
+    c.projection[3] = {0, 0, -1, 0};
+  }
+  else
+  {
+    c.projection[0] = {p[0], 0, 0, p[1]};
+    c.projection[1] = {0, p[2], 0, p[3]};
+    c.projection[2] = {0, 0, p[4], p[5]};
+    c.projection[3] = {0, 0, 0, 1};
+  }
+  c.viewport = {2 * xfmem.viewport.wd, 2 * xfmem.viewport.ht};
+  c.pixelcentercorrection = {
+      c.viewport[0] != 0 ? (1.0f / 6.0f) / c.viewport[0] : 0,
+      c.viewport[1] != 0 ? (1.0f / 6.0f) / c.viewport[1] : 0,
+      xfmem.viewport.zRange / 16777215.0f,
+      1.0f - xfmem.viewport.farZ / 16777215.0f};
+  // This renderer keeps the host viewport at [0,1]. Apply the complete GX
+  // depth range in the shader, including negative and oversized ranges.
+  // A fixed inversion incorrectly makes sky depth occlude reversed-Z scenes.
+  std::vector<std::uint8_t> bytes(sizeof(c));
+  std::memcpy(bytes.data(), &c, sizeof(c));
+  return bytes;
+}
 
 APIType ConvertApi(DolphinShaderApi api)
 {
@@ -166,7 +289,7 @@ void LoadHostConfig(DolphinShaderApi api, const DolphinShaderCapabilities& caps,
 // is hardcoded to 1.0f (native): DolphinShaderOptions never configures
 // upscaling, so that's exactly what a real FramebufferManager would have
 // produced anyway.
-std::vector<std::uint8_t> BuildRealPixelConstants()
+std::vector<std::uint8_t> BuildRealPixelConstants(const moderngekko::GxStateView& state)
 {
   PixelShaderConstants c{};
 
@@ -396,6 +519,28 @@ std::vector<std::uint8_t> BuildRealPixelConstants()
   }
 
   // Texture dims/sampler state per unit -- units 0-3 at BP 0x80 (mode0)/
+  // Both hardware banks persist independently even though writes share
+  // BP addresses E0..E7. A flat BP snapshot preserves only the last bank.
+  if (state.tev_colors.size() == 8 && state.tev_konst.size() == 8)
+  {
+    auto signed11 = [](std::uint32_t value) -> std::int32_t {
+      value &= 0x7FFu;
+      return (value & 0x400u) ? static_cast<std::int32_t>(value) - 0x800 : static_cast<std::int32_t>(value);
+    };
+    for (int num = 0; num < 4; ++num)
+    {
+      const auto ra = state.tev_colors[2 * num], bg = state.tev_colors[2 * num + 1];
+      c.colors[num][0] = signed11(ra);
+      c.colors[num][3] = signed11(ra >> 12);
+      c.colors[num][2] = signed11(bg);
+      c.colors[num][1] = signed11(bg >> 12);
+      const auto kra = state.tev_konst[2 * num], kbg = state.tev_konst[2 * num + 1];
+      set_tev_konst(num, 0, kra & 0xFFu);
+      set_tev_konst(num, 3, (kra >> 12) & 0xFFu);
+      set_tev_konst(num, 2, kbg & 0xFFu);
+      set_tev_konst(num, 1, (kbg >> 12) & 0xFFu);
+    }
+  }
   // 0x84 (mode1)/0x88 (image0, width+height), units 4-7 at the same offsets
   // within the 0xA0/0xA4/0xA8 group (see BPStructs.cpp's
   // BPMEM_TX_SETMODE0/1/IMAGE0 and _4 case labels).
@@ -436,6 +581,9 @@ DolphinShaderBundle DolphinShaderCompiler::Compile(
   LoadHostConfig(api, capabilities, options);
   const APIType dolphin_api = ConvertApi(api);
   const ShaderHostConfig host = ShaderHostConfig::GetCurrent();
+  // These backend flags affect emitted code but are absent from host.bits.
+  const std::uint32_t extra_caps = capabilities.binding_layout |
+      (capabilities.texture_query_levels << 1) | (capabilities.coarse_derivatives << 2);
 
   VertexShaderUid vertex_uid = GetVertexShaderUid();
   PixelShaderUid pixel_uid = GetPixelShaderUid();
@@ -444,22 +592,35 @@ DolphinShaderBundle DolphinShaderCompiler::Compile(
   UberShader::PixelShaderUid uber_pixel_uid = UberShader::GetPixelShaderUid();
 
   DolphinShaderBundle bundle;
-  bundle.vertex =
-      GenerateVertexShaderCode(dolphin_api, host, vertex_uid.GetUidData(), {}).GetBuffer();
-  bundle.pixel =
-      GeneratePixelShaderCode(dolphin_api, host, pixel_uid.GetUidData(), {}).GetBuffer();
-  bundle.geometry =
-      GenerateGeometryShaderCode(dolphin_api, host, geometry_uid.GetUidData()).GetBuffer();
-  bundle.uber_vertex =
-      UberShader::GenVertexShader(dolphin_api, host, uber_vertex_uid.GetUidData()).GetBuffer();
-  bundle.uber_pixel =
-      UberShader::GenPixelShader(dolphin_api, host, uber_pixel_uid.GetUidData()).GetBuffer();
+  BlendingState blending;
+  blending.Generate(bpmem);
+  DepthState depth;
+  depth.Generate(bpmem);
+  RasterizationState raster;
+  raster.Generate(bpmem, ConvertTopology(topology));
+  bundle.blend_state = blending.hex;
+  bundle.depth_state = depth.hex;
+  bundle.raster_state = raster.hex;
+  bundle.vertex = CachedSource(dolphin_api, host, extra_caps, 0, vertex_uid, [&] {
+    return GenerateVertexShaderCode(dolphin_api, host, vertex_uid.GetUidData(), {}).GetBuffer(); });
+  bundle.pixel = CachedSource(dolphin_api, host, extra_caps, 1, pixel_uid, [&] {
+    return GeneratePixelShaderCode(dolphin_api, host, pixel_uid.GetUidData(), {}).GetBuffer(); });
+  if (options.generate_auxiliary_shaders)
+  {
+    bundle.geometry = CachedSource(dolphin_api, host, extra_caps, 2, geometry_uid, [&] {
+      return GenerateGeometryShaderCode(dolphin_api, host, geometry_uid.GetUidData()).GetBuffer(); });
+    bundle.uber_vertex = CachedSource(dolphin_api, host, extra_caps, 3, uber_vertex_uid, [&] {
+      return UberShader::GenVertexShader(dolphin_api, host, uber_vertex_uid.GetUidData()).GetBuffer(); });
+    bundle.uber_pixel = CachedSource(dolphin_api, host, extra_caps, 4, uber_pixel_uid, [&] {
+      return UberShader::GenPixelShader(dolphin_api, host, uber_pixel_uid.GetUidData()).GetBuffer(); });
+  }
   bundle.vertex_uid = HashUid(vertex_uid);
   bundle.pixel_uid = HashUid(pixel_uid);
   bundle.geometry_uid = HashUid(geometry_uid);
   bundle.uber_vertex_uid = HashUid(uber_vertex_uid);
   bundle.uber_pixel_uid = HashUid(uber_pixel_uid);
-  bundle.pixel_constants = BuildRealPixelConstants();
+  bundle.pixel_constants = BuildRealPixelConstants(state);
+  bundle.vertex_constants = BuildRealVertexConstants(state);
   return bundle;
 }
 }

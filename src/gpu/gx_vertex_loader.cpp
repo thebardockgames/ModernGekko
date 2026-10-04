@@ -126,7 +126,9 @@ const std::uint8_t* AttributeData(Reader& reader, const AddressSpace& memory,
 
 float ReadComponent(const std::uint8_t* data, std::uint32_t format, std::uint32_t fraction)
 {
-  const float scale = std::ldexp(1.0f, -static_cast<int>(fraction));
+  // GX fractions are 0..31 (integer normals use 6/7/14/15). This is the
+  // exact normal IEEE-754 power of two, without a CRT ldexp call per component.
+  const float scale = std::bit_cast<float>((127u - fraction) << 23);
   switch (format)
   {
   case 0: return data[0] * scale;

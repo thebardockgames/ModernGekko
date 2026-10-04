@@ -84,6 +84,33 @@ int main(void)
         return 8;
     descriptor.cpu_state_size--;
 
+    // Each CPU ABI only extends the previous prefix; legacy modules are
+    // accepted at their exact old size, while unknown versions and truncated
+    // new states are not.
+    COMPILE_ASSERT(cpu_abi_version_is_four, MODERNGEKKO_CPU_ABI_VERSION == 4u);
+    descriptor.cpu_abi_version = 2u;
+    descriptor.cpu_state_size = (uint32_t)offsetof(CPUState, dispatch_budget);
+    if (moderngekko_validate_module(&descriptor, &requirements) != MODERNGEKKO_MODULE_OK)
+        return 11;
+    descriptor.cpu_state_size++;
+    if (moderngekko_validate_module(&descriptor, &requirements) !=
+        MODERNGEKKO_MODULE_CPU_STATE_SIZE_MISMATCH) return 12;
+    descriptor.cpu_abi_version = 3u;
+    descriptor.cpu_state_size = (uint32_t)offsetof(CPUState, chunk_state);
+    if (moderngekko_validate_module(&descriptor, &requirements) != MODERNGEKKO_MODULE_OK)
+        return 14;
+    descriptor.cpu_state_size = sizeof(CPUState);
+    if (moderngekko_validate_module(&descriptor, &requirements) !=
+        MODERNGEKKO_MODULE_CPU_STATE_SIZE_MISMATCH) return 15;
+    descriptor.cpu_abi_version = MODERNGEKKO_CPU_ABI_VERSION;
+    descriptor.cpu_state_size = (uint32_t)offsetof(CPUState, dispatch_budget);
+    if (moderngekko_validate_module(&descriptor, &requirements) !=
+        MODERNGEKKO_MODULE_CPU_STATE_SIZE_MISMATCH) return 13;
+    descriptor.cpu_state_size = (uint32_t)offsetof(CPUState, chunk_state);
+    if (moderngekko_validate_module(&descriptor, &requirements) !=
+        MODERNGEKKO_MODULE_CPU_STATE_SIZE_MISMATCH) return 16;
+    descriptor.cpu_state_size = sizeof(CPUState);
+
     descriptor.entry_point = 0x80004000u;
     if (moderngekko_validate_module(&descriptor, &requirements) !=
         MODERNGEKKO_MODULE_ENTRY_POINT_UNCOVERED)

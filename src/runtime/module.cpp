@@ -75,9 +75,19 @@ ModernGekkoModuleStatus moderngekko_validate_module(
         return MODERNGEKKO_MODULE_NULL_DESCRIPTOR;
     if (descriptor->abi_version != MODERNGEKKO_MODULE_ABI_VERSION)
         return MODERNGEKKO_MODULE_ABI_MISMATCH;
-    if (descriptor->cpu_abi_version != requirements->cpu_abi_version)
+    // Each CPU ABI only appends to the previous one, so a current host accepts
+    // older modules at their exact prefix size (v2: before dispatch_budget,
+    // v3: before chunk_state). Unknown versions and other sizes are rejected.
+    const bool current_host = requirements->cpu_abi_version == MODERNGEKKO_CPU_ABI_VERSION &&
+        requirements->cpu_state_size == sizeof(CPUState);
+    size_t expected_size = requirements->cpu_state_size;
+    if (current_host && descriptor->cpu_abi_version == 2u)
+        expected_size = offsetof(CPUState, dispatch_budget);
+    else if (current_host && descriptor->cpu_abi_version == 3u)
+        expected_size = offsetof(CPUState, chunk_state);
+    else if (descriptor->cpu_abi_version != requirements->cpu_abi_version)
         return MODERNGEKKO_MODULE_CPU_ABI_MISMATCH;
-    if (descriptor->cpu_state_size != requirements->cpu_state_size)
+    if (descriptor->cpu_state_size != expected_size)
         return MODERNGEKKO_MODULE_CPU_STATE_SIZE_MISMATCH;
     if (memchr(descriptor->game_id, '\0', sizeof(descriptor->game_id)) == NULL ||
         descriptor->game_id[0] == '\0')

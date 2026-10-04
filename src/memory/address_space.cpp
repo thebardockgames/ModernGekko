@@ -37,41 +37,43 @@ AddressSpace::AddressSpace(std::size_t mem1_size, std::size_t mem2_size)
 
 std::span<std::uint8_t> AddressSpace::GetMem1()
 {
-  return m_mem1;
+  return m_external ? m_external_mem1 : std::span<std::uint8_t>(m_mem1);
 }
 
 std::span<const std::uint8_t> AddressSpace::GetMem1() const
 {
-  return m_mem1;
+  return m_external ? std::span<const std::uint8_t>(m_external_mem1) : std::span<const std::uint8_t>(m_mem1);
 }
 
 std::span<std::uint8_t> AddressSpace::GetMem2()
 {
-  return m_mem2;
+  return m_external ? m_external_mem2 : std::span<std::uint8_t>(m_mem2);
 }
 
 std::span<const std::uint8_t> AddressSpace::GetMem2() const
 {
-  return m_mem2;
+  return m_external ? std::span<const std::uint8_t>(m_external_mem2) : std::span<const std::uint8_t>(m_mem2);
 }
 
 std::uint8_t* AddressSpace::Resolve(std::uint32_t address, std::size_t size)
 {
   const std::uint32_t physical = ToPhysicalAddress(address);
-  if (physical < m_mem1.size())
-    return ResolveRegion(m_mem1, physical, size);
+  auto mem1 = GetMem1(), mem2 = GetMem2();
+  if (physical < mem1.size())
+    return ResolveRegion(mem1, physical, size);
   if (physical >= Mem2Base)
-    return ResolveRegion(m_mem2, physical - Mem2Base, size);
+    return ResolveRegion(mem2, physical - Mem2Base, size);
   return nullptr;
 }
 
 const std::uint8_t* AddressSpace::Resolve(std::uint32_t address, std::size_t size) const
 {
   const std::uint32_t physical = ToPhysicalAddress(address);
-  if (physical < m_mem1.size())
-    return ResolveRegion(m_mem1, physical, size);
+  auto mem1 = GetMem1(), mem2 = GetMem2();
+  if (physical < mem1.size())
+    return ResolveRegion(mem1, physical, size);
   if (physical >= Mem2Base)
-    return ResolveRegion(m_mem2, physical - Mem2Base, size);
+    return ResolveRegion(mem2, physical - Mem2Base, size);
   return nullptr;
 }
 
@@ -149,7 +151,14 @@ bool AddressSpace::Write64(std::uint32_t address, std::uint64_t value)
 
 void AddressSpace::Clear()
 {
-  std::ranges::fill(m_mem1, 0u);
-  std::ranges::fill(m_mem2, 0u);
+  std::ranges::fill(GetMem1(), 0u);
+  std::ranges::fill(GetMem2(), 0u);
+}
+
+void AddressSpace::BindExternalMemory(std::span<std::uint8_t> mem1, std::span<std::uint8_t> mem2)
+{
+  m_external = true;
+  m_external_mem1 = mem1;
+  m_external_mem2 = mem2;
 }
 }

@@ -33,13 +33,22 @@ int main()
       .write(reinterpret_cast<const char*>(dol.data()), dol.size());
 
   const auto result = moderngekko::InspectGame(root);
+  const auto sha_path = root / "fingerprint.bin";
+  std::ofstream(sha_path, std::ios::binary).write("abc", 3);
+  const auto abc_hash = moderngekko::Sha256File(sha_path);
+  std::ofstream(sha_path, std::ios::binary).close();
+  const auto empty_hash = moderngekko::Sha256File(sha_path);
+  const auto missing_hash = moderngekko::Sha256File(root / "missing.bin");
   fs::remove_all(root);
   if (!result || result.metadata->disc_id != "TEST01" ||
       result.metadata->game_name != "Synthetic Test Game" ||
       result.metadata->platform != moderngekko::GamePlatform::Wii ||
       result.metadata->entry_point != 0x80003100u ||
       result.metadata->dol_sha256 !=
-          "ee292f5fc3d0e5cfa32d951bd682a3cd2806c102e4a0a50300a2c480e21bcef6")
+          "ee292f5fc3d0e5cfa32d951bd682a3cd2806c102e4a0a50300a2c480e21bcef6" ||
+      abc_hash != "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad" ||
+      empty_hash != "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855" ||
+      missing_hash)
     return 1;
   return 0;
 }

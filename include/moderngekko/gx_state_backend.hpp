@@ -15,6 +15,10 @@ struct GxStateView
   std::span<const std::uint32_t> cp;
   std::span<const std::uint32_t> xf;
   std::span<const std::uint32_t> bp;
+  std::span<const std::uint32_t> tev_colors;
+  std::span<const std::uint32_t> tev_konst;
+  std::span<const std::uint8_t> texture_memory;
+  std::uint64_t generation = 0; // Zero means an unversioned external view.
 };
 
 struct GxEfbCopy
@@ -40,6 +44,8 @@ struct GxEfbCopy
   bool copy_to_xfb = false;
   bool intensity_format = false;
   bool automatic_color_conversion = false;
+  bool depth_copy = false;
+  std::uint8_t clear_channels = 7; // RGB, alpha, depth update enables.
 };
 
 struct GxXfbPresent
@@ -54,6 +60,9 @@ class GxRenderDevice
 {
 public:
   virtual ~GxRenderDevice() = default;
+  virtual bool WantsDecodedDraws() const { return true; }
+  virtual bool WantsCpuProfiling() const { return false; }
+  virtual void RecordVertexDecode(double) {}
   virtual void SubmitDraw(const GxDrawPacket& packet, const GxStateView& state) = 0;
   virtual void SubmitDecodedDraw(const GxDrawPacket& packet, const GxDecodedDraw& decoded,
                                  const GxStateView& state)
@@ -63,6 +72,7 @@ public:
   virtual void InvalidateVertexCache() {}
   virtual void CopyEfb(const GxEfbCopy&) {}
   virtual void PresentXfb(const GxXfbPresent&) {}
+  virtual void InvalidateTextures() {}
 };
 
 class GxStateBackend final : public GpuBackend
@@ -89,9 +99,13 @@ private:
   AddressSpace& m_memory;
   GxRenderDevice* m_device = nullptr;
   GxVertexLoader m_vertex_loader;
+  GxDecodedDraw m_decoded_draw;
   std::array<std::uint32_t, 256> m_cp{};
   std::array<std::uint32_t, 0x1058> m_xf{};
   std::array<std::uint32_t, 256> m_bp{};
+  std::array<std::uint32_t, 8> m_tev_colors{}, m_tev_konst{};
+  std::vector<std::uint8_t> m_texture_memory = std::vector<std::uint8_t>(1024 * 1024);
   std::uint32_t m_bp_mask = 0xFFFFFFu;
+  std::uint64_t m_generation = 1;
 };
 }

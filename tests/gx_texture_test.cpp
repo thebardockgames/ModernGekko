@@ -134,5 +134,10 @@ int main()
   {
     return 13;
   }
+  const std::array<std::uint32_t, 3> packed{0x11223344u, 0x0066FFFFu, 0xFFFF0000u};
+  const std::vector<std::uint8_t> expected{0x11, 0x22, 0x33, 0x44, 0x00, 0x66,
+                                          0xFF, 0xFF, 0xFF, 0xFF, 0x00, 0x00};
+  if (moderngekko::GxTextureDecoder::ToRgba8Bytes(packed) != expected)
+    return 14;
   return 0;
 }

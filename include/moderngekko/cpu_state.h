@@ -8,7 +8,7 @@
 extern "C" {
 #endif
 
-#define MODERNGEKKO_CPU_ABI_VERSION 2u
+#define MODERNGEKKO_CPU_ABI_VERSION 4u
 #define GXRUNTIME_CPU_ABI_VERSION MODERNGEKKO_CPU_ABI_VERSION
 
 typedef struct CPUState CPUState;
@@ -70,6 +70,11 @@ struct CPUState
     int64_t downcount;
     uint8_t* exram;
     uint32_t exram_size;
+    int64_t dispatch_budget;
+    // ABI v4: chassis-owned per-chunk SMC state (1 = verified), indexed like
+    // the module chunk table. Native direct calls consult it before entering
+    // another chunk. NULL disables native direct calls.
+    const uint8_t* chunk_state;
 };
 
 #ifdef __cplusplus

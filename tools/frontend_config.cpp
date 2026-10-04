@@ -54,6 +54,7 @@ ConfigResult LoadConfig(const fs::path& user_directory, bool create_if_missing)
 
   std::string resolution;
   std::string controller;
+  std::string graphics_backend;
   bool show_fps_in_title = true;
   std::string line;
   while (std::getline(file, line))
@@ -73,6 +74,12 @@ ConfigResult LoadConfig(const fs::path& user_directory, bool create_if_missing)
       resolution = value;
     else if (key == "controller")
       controller = raw_value;
+    else if (key == "graphics_backend")
+    {
+      if (value == "natived3d12") graphics_backend = "NativeD3D12";
+      else if (value != "automatic" && !value.empty())
+        return {.error = "graphics_backend must be automatic or NativeD3D12"};
+    }
     else if (key == "show_fps_in_title")
     {
       if (value == "true" || value == "1" || value == "yes" || value == "on")
@@ -92,7 +99,8 @@ ConfigResult LoadConfig(const fs::path& user_directory, bool create_if_missing)
       return {.dolphin_scale = option.dolphin_scale,
               .resolution = std::move(resolution),
               .controller = std::move(controller),
-              .show_fps_in_title = show_fps_in_title};
+              .show_fps_in_title = show_fps_in_title,
+              .graphics_backend = graphics_backend};
   }
 
   // Dolphin also accepts exact raw EFB multiples even when they do not have a common display label.
@@ -103,7 +111,8 @@ ConfigResult LoadConfig(const fs::path& user_directory, bool create_if_missing)
       return {.dolphin_scale = scale,
               .resolution = std::move(resolution),
               .controller = std::move(controller),
-              .show_fps_in_title = show_fps_in_title};
+              .show_fps_in_title = show_fps_in_title,
+              .graphics_backend = graphics_backend};
   }
 
   return {.error = "unsupported Dolphin internal resolution '" + resolution +
@@ -111,7 +120,8 @@ ConfigResult LoadConfig(const fs::path& user_directory, bool create_if_missing)
 }
 
 bool SaveConfig(const fs::path& user_directory, std::string_view resolution,
-                bool show_fps_in_title, std::string_view controller, std::string* error)
+                bool show_fps_in_title, std::string_view controller, std::string* error,
+                std::string_view graphics_backend)
 {
   std::error_code ec;
   fs::create_directories(user_directory, ec);
@@ -133,6 +143,7 @@ bool SaveConfig(const fs::path& user_directory, std::string_view resolution,
           "[Video]\n"
           "resolution=" << resolution << '\n'
        << "show_fps_in_title=" << (show_fps_in_title ? "true" : "false") << '\n'
+       << "graphics_backend=" << (graphics_backend.empty() ? "automatic" : graphics_backend) << '\n'
        << "[Input]\n"
        << "controller=" << controller << '\n';
   return true;

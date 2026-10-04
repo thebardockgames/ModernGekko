@@ -39,6 +39,7 @@ public:
   void SubmitDraw(const GxDrawPacket&, const GxStateView&) override {}
   void SubmitDecodedDraw(const GxDrawPacket& packet, const GxDecodedDraw& decoded,
                          const GxStateView& state) override;
+  void CopyEfb(const GxEfbCopy& copy) override;
 
   // F9-gated manual arming: starts disarmed so boot/menu content never
   // fills up the (small, one-shot) draw budget before the player actually
@@ -47,6 +48,11 @@ public:
   // to session). Edge-triggered toggle, polled from OnRawFifoBytesForDump.
   void ToggleArmed() { m_armed = !m_armed; }
   bool IsArmed() const { return m_armed; }
+  void SetArmed(bool armed) { m_armed = armed; }
+  void SetCaptureAll(bool capture_all) { m_capture_all = capture_all; }
+  void SetCaptureTextures(bool enabled) { m_capture_textures = enabled; }
+  void SetLiveRequestPath(std::string path) { m_live_request_path = std::move(path); }
+  void SetFrameStride(std::uint64_t stride) { m_frame_stride = stride > 0 ? stride : 1; }
 
   // The texture's TLUT is populated asynchronously by Dolphin's real video
   // thread (see MaybeDumpTexture) and may lag behind the vertex captures by
@@ -62,9 +68,18 @@ private:
   void MaybeDumpTexture(const GxStateView& state);
   // Returns true and writes m_texture_path if this unit resolves to a
   // real, non-degenerate (not flat/fully-transparent) texture.
-  bool TryDumpTextureUnit(const GxStateView& state, std::uint32_t unit);
+  bool TryDumpTextureUnit(const GxStateView& state, std::uint32_t unit, bool snapshot = false);
 
   bool m_armed = false;
+  bool m_capture_all = false;
+  std::uint64_t m_frame = 0;
+  std::uint64_t m_frame_stride = 1;
+  std::string m_live_request_path;
+  std::uint64_t m_live_request = 0;
+  bool m_live_capture = false;
+  int m_live_start_draws = 0;
+  bool m_capture_textures = false;
+  std::array<std::string, 8> m_texture_snapshots;
   std::string m_vertex_path;
   std::string m_texture_path;
   const AddressSpace* m_memory = nullptr;
@@ -82,7 +97,7 @@ private:
   std::string m_states_path;
   std::unordered_map<std::uint64_t, int> m_state_index_by_hash;
   int m_states_written = 0;
-  int WriteOrReuseState(const GxStateView& state);
+  int WriteOrReuseState(const GxStateView& state, std::uint8_t vat);
 };
 
 // Opt-in via MODERNGEKKO_GX_VERTEX_DUMP=<path>. If MODERNGEKKO_GX_LOG is also
@@ -94,4 +109,10 @@ private:
 // just grab that instead of real gameplay -- set it to roughly how long it
 // takes you to get from boot to the content you actually want captured.
 void MaybeEnableGxVertexDump();
+
+// Phase 9e: current F9 capture-arming status, meant for display in the
+// window title bar (see Host_UpdateTitle in dolphin_runtime.cpp) so the
+// player doesn't have to guess/remember whether a press registered.
+// Returns an empty string if MODERNGEKKO_GX_VERTEX_DUMP isn't set at all.
+std::string GxVertexDumpStatusText();
 }

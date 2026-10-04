@@ -45,6 +45,15 @@ int main()
     return 5;
   }
 
+  // Windows does not permit deleting this file while the stream owns it.
+  input.close();
+  if (!moderngekko::frontend::SaveConfig(directory, "1920x1080", true, controller, &error, "NativeD3D12"))
+    return 6;
+  const auto native = moderngekko::frontend::LoadConfig(directory, false);
+  if (!native || native.graphics_backend != "NativeD3D12" || native.controller != controller)
+    return 7;
+  std::ofstream(directory / "config.ini") << "resolution=1920x1080\ngraphics_backend=unknown\n";
+  if (moderngekko::frontend::LoadConfig(directory, false)) return 8;
   fs::remove_all(directory);
   return 0;
 }

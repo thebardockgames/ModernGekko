@@ -17,6 +17,8 @@ public:
 
   explicit AddressSpace(bool enable_mem2 = false);
   AddressSpace(std::size_t mem1_size, std::size_t mem2_size);
+  // Borrow memory for synchronous FIFO observation; caller owns its lifetime.
+  void BindExternalMemory(std::span<std::uint8_t> mem1, std::span<std::uint8_t> mem2);
 
   std::span<std::uint8_t> GetMem1();
   std::span<const std::uint8_t> GetMem1() const;
@@ -41,5 +43,7 @@ public:
 private:
   std::vector<std::uint8_t> m_mem1;
   std::vector<std::uint8_t> m_mem2;
+  bool m_external = false;
+  std::span<std::uint8_t> m_external_mem1, m_external_mem2;
 };
 }

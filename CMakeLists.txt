@@ -5,6 +5,21 @@ else()
     project(ModernGekko LANGUAGES C CXX)
 endif()
 
+# Ninja parses /showIncludes to track header dependencies. Localized MSVC
+# messages can use a different encoding from CMake's detected prefix, leaving
+# old object layouts linked after a header edit. Match the detected localized
+# prefix using UTF-8 compiler output on every Ninja build.
+if(MSVC AND CMAKE_GENERATOR MATCHES "Ninja")
+    set(CMAKE_CL_SHOWINCLUDES_PREFIX "${CMAKE_CXX_CL_SHOWINCLUDES_PREFIX}")
+    if(CMAKE_CL_SHOWINCLUDES_PREFIX MATCHES "^Nota:")
+        set(CMAKE_CL_SHOWINCLUDES_PREFIX "Nota: inclusión del archivo: ")
+    endif()
+    foreach(_moderngekko_language C CXX)
+        set(CMAKE_${_moderngekko_language}_COMPILER_LAUNCHER
+            "cmd.exe;/d;/c;${CMAKE_CURRENT_SOURCE_DIR}/cmake/msvc-utf8.cmd")
+    endforeach()
+endif()
+
 include(CTest)
 include(CheckIncludeFileCXX)
 
@@ -87,6 +102,8 @@ if(MODERNGEKKO_ENABLE_DOLPHIN_RUNTIME)
     set(LINUX_LOCAL_DEV ON CACHE BOOL "" FORCE)
     set(DISTRIBUTOR "ModernGekko" CACHE STRING "" FORCE)
     add_subdirectory(vendor/dolphin EXCLUDE_FROM_ALL)
+    # VideoCommon compares its decoder with the native one (MODERNGEKKO_NATIVE_GX_VERIFY).
+    target_link_libraries(videocommon PRIVATE moderngekko_native_gx)
     if(MSVC AND TARGET glslang-default-resource-limits)
         # glslang's C resource-limits shim uses strncpy with /WX (warnings
         # as errors) on, which MSVC's CRT deprecation warning turns fatal.
@@ -110,10 +127,16 @@ else()
     add_subdirectory(vendor/fmt/fmt EXCLUDE_FROM_ALL)
 endif()
 
+set(_dolrecomp_default "${CMAKE_CURRENT_SOURCE_DIR}/vendor/dolphin/DolRecomp")
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/../DolRecomp/CMakeLists.txt")
+    set(_dolrecomp_default "${CMAKE_CURRENT_SOURCE_DIR}/../DolRecomp")
+endif()
+set(MODERNGEKKO_DOLRECOMP_SOURCE_DIR "${_dolrecomp_default}" CACHE PATH
+    "DolRecomp source used to generate native modules")
 if(BUILD_TESTING)
-    add_subdirectory(vendor/dolphin/DolRecomp)
+    add_subdirectory("${MODERNGEKKO_DOLRECOMP_SOURCE_DIR}" dolrecomp)
 else()
-    add_subdirectory(vendor/dolphin/DolRecomp EXCLUDE_FROM_ALL)
+    add_subdirectory("${MODERNGEKKO_DOLRECOMP_SOURCE_DIR}" dolrecomp EXCLUDE_FROM_ALL)
 endif()
 
 add_library(moderngekko_abi INTERFACE)
@@ -163,6 +186,29 @@ if(MSVC)
     # sibling targets like this one that happen to include the same sources.
     target_compile_options(moderngekko PRIVATE /Zc:preprocessor)
     target_compile_definitions(moderngekko PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
+endif()
+
+# Native GX renderer (tools/NATIVE_RENDERER_PLAN.md): self-contained, no Dolphin headers.
+add_library(moderngekko_native_gx STATIC
+    src/native_gx/command_decoder.cpp
+    src/native_gx/gx_state.cpp
+    src/native_gx/vertex_loader.cpp
+)
+add_library(ModernGekko::NativeGX ALIAS moderngekko_native_gx)
+target_include_directories(moderngekko_native_gx PUBLIC
+    "${CMAKE_CURRENT_SOURCE_DIR}/include")
+target_compile_features(moderngekko_native_gx PUBLIC cxx_std_20)
+target_sources(moderngekko_native_gx PRIVATE
+    src/native_gx/raster_setup.cpp
+    src/native_gx/texture_decoder.cpp
+    src/native_gx/texture_state.cpp
+    src/native_gx/material.cpp
+    src/native_gx/shader_gen.cpp
+    src/native_gx/efb_copy.cpp
+)
+if(WIN32)
+    target_sources(moderngekko_native_gx PRIVATE src/native_gx/d3d12_renderer.cpp src/native_gx/frontend.cpp)
+    target_link_libraries(moderngekko_native_gx PUBLIC d3d12 dxgi d3dcompiler)
 endif()
 
 add_library(moderngekko_dolphin_video STATIC
@@ -251,6 +297,9 @@ if(MODERNGEKKO_ENABLE_DOLPHIN_RUNTIME)
         vendor/dolphin/Source/Core/DolphinNoGUI/Platform.cpp
         vendor/dolphin/Source/Core/DolphinNoGUI/PlatformHeadless.cpp
     )
+    if(WIN32)
+        target_sources(moderngekko PRIVATE src/gpu/gx_live_device.cpp)
+    endif()
     if(APPLE)
         # Dolphin's windowed backend for macOS
         target_sources(moderngekko PRIVATE
@@ -410,13 +459,30 @@ target_link_libraries(moderngekko-module-info
 
 if(MODERNGEKKO_ENABLE_DOLPHIN_RUNTIME)
     add_executable(moderngekko-run tools/moderngekko_run.cpp)
-    target_sources(moderngekko-run PRIVATE tools/frontend_config.cpp)
+    target_sources(moderngekko-run PRIVATE tools/frontend_config.cpp tools/native_presenter.cpp)
+    if(WIN32)
+        add_executable(moderngekko-native-renderer tests/native_render_window.cpp src/gpu/gx_texture_decoder.cpp)
+        target_link_libraries(moderngekko-native-renderer PRIVATE ModernGekko::DolphinVideo
+            ModernGekko::GlslToHlsl d3dcompiler.lib d3d12.lib dxgi.lib)
+        target_compile_definitions(moderngekko-native-renderer PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
+        add_library(moderngekko-native-renderer-direct SHARED tests/native_render_window.cpp src/gpu/gx_texture_decoder.cpp)
+        target_link_libraries(moderngekko-native-renderer-direct PRIVATE ModernGekko::DolphinVideo
+            ModernGekko::GlslToHlsl d3dcompiler.lib d3d12.lib dxgi.lib)
+        target_compile_definitions(moderngekko-native-renderer-direct PRIVATE
+            MODERNGEKKO_RENDERER_LIBRARY UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
+        target_compile_definitions(moderngekko-run PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
+        add_dependencies(moderngekko-run moderngekko-native-renderer moderngekko-native-renderer-direct)
+    endif()
     target_include_directories(moderngekko-run PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/tools")
     if(MODERNGEKKO_FRONTEND_SDK)
         set_property(TARGET moderngekko-run PROPERTY BUILD_RPATH
             "${_moderngekko_sdk_lib}")
     endif()
     target_link_libraries(moderngekko-run PRIVATE ModernGekko::Runtime)
+    if(MSVC)
+        target_link_options(moderngekko-run PRIVATE
+            "/MAP:${CMAKE_CURRENT_BINARY_DIR}/moderngekko-run.map")
+    endif()
     add_custom_command(TARGET moderngekko-run POST_BUILD
         COMMAND ${CMAKE_COMMAND} -E copy_directory
                 "${CMAKE_CURRENT_SOURCE_DIR}/vendor/dolphin/Data/Sys"
@@ -485,16 +551,23 @@ if(MODERNGEKKO_ENABLE_DOLPHIN_RUNTIME)
     add_executable(moderngekko-port tools/moderngekko_port.cpp)
     target_link_libraries(moderngekko-port PRIVATE ModernGekko::Runtime)
     target_compile_definitions(moderngekko-port PRIVATE
-        MODERNGEKKO_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
+        MODERNGEKKO_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}"
+        MODERNGEKKO_CMAKE_EXECUTABLE="${CMAKE_COMMAND}"
+        MODERNGEKKO_NINJA_EXECUTABLE="${CMAKE_MAKE_PROGRAM}")
     if(MSVC)
         target_compile_options(moderngekko-port PRIVATE /Zc:preprocessor)
         target_compile_definitions(moderngekko-port PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
     endif()
-    add_dependencies(moderngekko-port dolrecomp moderngekko-run)
-    add_custom_command(TARGET moderngekko-port POST_BUILD
+    # The port builder runs the generator next to itself. Sync it on every
+    # build: a POST_BUILD step would leave a stale generator whenever only
+    # DolRecomp changed and moderngekko-port did not relink.
+    add_custom_target(moderngekko-port-generator ALL
         COMMAND ${CMAKE_COMMAND} -E copy_if_different
                 "$<TARGET_FILE:dolrecomp>"
-                "$<TARGET_FILE_DIR:moderngekko-port>")
+                "$<TARGET_FILE_DIR:moderngekko-port>"
+        DEPENDS dolrecomp
+        VERBATIM)
+    add_dependencies(moderngekko-port dolrecomp moderngekko-run moderngekko-port-generator)
 endif()
 
 if(BUILD_TESTING)
@@ -671,6 +744,15 @@ if(BUILD_TESTING)
     add_test(NAME moderngekko.gx_commands
              COMMAND moderngekko_gx_commands_test)
 
+    add_executable(moderngekko_native_gx_decoder_test
+        tests/native_gx_decoder_test.cpp
+    )
+    target_link_libraries(moderngekko_native_gx_decoder_test
+        PRIVATE ModernGekko::NativeGX
+    )
+    add_test(NAME moderngekko.native_gx_decoder
+             COMMAND moderngekko_native_gx_decoder_test)
+
     add_executable(moderngekko_gx_state_test
         tests/gx_state_test.cpp
     )
@@ -679,6 +761,55 @@ if(BUILD_TESTING)
     )
     add_test(NAME moderngekko.gx_state
              COMMAND moderngekko_gx_state_test)
+    if(WIN32 AND MODERNGEKKO_ENABLE_DOLPHIN_RUNTIME)
+        add_executable(moderngekko_staticrecomp_kernel_test tests/staticrecomp_kernel_test.cpp)
+        add_executable(moderngekko_staticrecomp_memory_test tests/staticrecomp_memory_test.cpp)
+        add_executable(moderngekko_branch_codegen tests/native_branch_codegen.c)
+        target_link_libraries(moderngekko_branch_codegen PRIVATE dr_backend)
+        set(_native_branch_c "${CMAKE_CURRENT_BINARY_DIR}/native_branch_generated.c")
+        add_custom_command(OUTPUT "${_native_branch_c}"
+            COMMAND moderngekko_branch_codegen "${_native_branch_c}"
+            DEPENDS moderngekko_branch_codegen VERBATIM)
+        add_executable(moderngekko_native_branch_test tests/native_branch_test.cpp "${_native_branch_c}"
+            "vendor/dolphin/GXRuntime/src/core/cpu.c")
+        # Function-level (fast) generated code vs. legacy chunk code.
+        add_executable(moderngekko_fast_codegen tests/native_fast_codegen.c)
+        target_link_libraries(moderngekko_fast_codegen PRIVATE dr_backend)
+        set(_native_fast_dir "${CMAKE_CURRENT_BINARY_DIR}/native_fast")
+        set(_native_fast_outputs "${_native_fast_dir}/fasttest.h"
+            "${_native_fast_dir}/chunks/code.c" "${_native_fast_dir}/chunks/fast_tables.c")
+        add_custom_command(OUTPUT ${_native_fast_outputs}
+            COMMAND "${CMAKE_COMMAND}" -E make_directory "${_native_fast_dir}/chunks"
+            COMMAND moderngekko_fast_codegen ${_native_fast_outputs}
+            DEPENDS moderngekko_fast_codegen VERBATIM)
+        add_executable(moderngekko_native_fast_test tests/native_fast_test.cpp
+            "${_native_fast_dir}/chunks/code.c" "${_native_fast_dir}/chunks/fast_tables.c"
+            "vendor/dolphin/GXRuntime/src/core/cpu.c")
+        target_include_directories(moderngekko_native_fast_test PRIVATE "${_native_fast_dir}")
+        foreach(_native_cpu_test moderngekko_staticrecomp_kernel_test moderngekko_staticrecomp_memory_test moderngekko_native_branch_test moderngekko_native_fast_test)
+        target_link_libraries(${_native_cpu_test} PRIVATE ModernGekko::Runtime core)
+        target_include_directories(${_native_cpu_test} PRIVATE
+            "${CMAKE_CURRENT_SOURCE_DIR}/vendor/dolphin/Source/Core"
+            "${CMAKE_CURRENT_SOURCE_DIR}/vendor/dolphin/GXRuntime/include")
+        target_compile_features(${_native_cpu_test} PRIVATE cxx_std_23)
+        target_compile_definitions(${_native_cpu_test} PRIVATE
+            UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX
+            $<TARGET_PROPERTY:moderngekko,COMPILE_DEFINITIONS>)
+        if(MSVC)
+            target_compile_options(${_native_cpu_test} PRIVATE /Zc:preprocessor)
+        endif()
+        endforeach()
+        add_test(NAME moderngekko.staticrecomp_kernel COMMAND moderngekko_staticrecomp_kernel_test)
+        add_test(NAME moderngekko.staticrecomp_memory COMMAND moderngekko_staticrecomp_memory_test)
+        add_test(NAME moderngekko.native_branch COMMAND moderngekko_native_branch_test)
+        add_test(NAME moderngekko.native_fast COMMAND moderngekko_native_fast_test)
+        add_executable(moderngekko_gx_live_test tests/gx_live_test.cpp)
+        target_link_libraries(moderngekko_gx_live_test PRIVATE ModernGekko::Runtime)
+        add_test(NAME moderngekko.gx_live COMMAND moderngekko_gx_live_test)
+        add_executable(moderngekko_gx_direct_frame_test tests/gx_direct_frame_test.cpp)
+        target_link_libraries(moderngekko_gx_direct_frame_test PRIVATE ModernGekko::Runtime)
+        add_test(NAME moderngekko.gx_direct_frame COMMAND moderngekko_gx_direct_frame_test)
+    endif()
 
     add_executable(moderngekko_gx_vertex_test
         tests/gx_vertex_test.cpp
@@ -744,6 +875,7 @@ if(BUILD_TESTING)
         # window. See tests/native_render_window.cpp.
         add_executable(moderngekko_native_render_window
             tests/native_render_window.cpp
+            src/gpu/gx_texture_decoder.cpp
         )
         target_link_libraries(moderngekko_native_render_window
             PRIVATE ModernGekko::DolphinVideo ModernGekko::GlslToHlsl

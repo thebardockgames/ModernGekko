@@ -4,6 +4,7 @@
 #include "moderngekko/module_abi.h"
 
 #include <filesystem>
+#include <cstdint>
 #include <memory>
 #include <optional>
 #include <string>
@@ -31,6 +32,13 @@ struct GraphicsSettings
 {
   std::string backend;
   std::optional<int> internal_resolution_scale;
+  bool external_presentation = false;
+  // Native GX renderer presents in the window; Dolphin's video backend is Null.
+  // It renders at internal_resolution_scale (1 = 640 x 528 EFB).
+  bool native_gx = false;
+  // Client size of the game window (Dolphin's render window settings).
+  std::optional<int> window_width;
+  std::optional<int> window_height;
 };
 
 struct AudioSettings
@@ -50,6 +58,14 @@ enum class WindowSystem
   X11,
 };
 
+// Extra image between two game frames (see VideoCommon/FrameInterpolation.h).
+enum class FrameInterpolationMode
+{
+  Off,
+  Replay,       // diagnostic: the extra image is the unchanged frame
+  Interpolate,  // transforms and moving vertices blended with the previous frame
+};
+
 struct RuntimeConfig
 {
   std::filesystem::path game_root;
@@ -63,6 +79,12 @@ struct RuntimeConfig
   bool allow_interpreter = false;
   bool show_fps_in_title = true;
   std::optional<std::string> window_title;
+  std::filesystem::path load_state;
+  std::filesystem::path save_state;
+  std::uint64_t save_state_frame = 6600;
+  std::uint64_t frame_offset = 0;
+  std::uint64_t stop_after_frame = 0;
+  FrameInterpolationMode frame_interpolation = FrameInterpolationMode::Off;
 };
 
 enum class RuntimeErrorCode

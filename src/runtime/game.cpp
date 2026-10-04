@@ -90,6 +90,12 @@ std::optional<std::vector<std::uint8_t>> ReadFile(const std::filesystem::path& p
 }
 }  // namespace
 
+std::optional<std::string> Sha256File(const std::filesystem::path& path)
+{
+  auto bytes = ReadFile(path);
+  return bytes ? std::optional{Sha256(std::move(*bytes))} : std::nullopt;
+}
+
 GameInspectResult InspectGame(const std::filesystem::path& input_root)
 {
   std::error_code ec;
