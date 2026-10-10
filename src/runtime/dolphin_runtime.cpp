@@ -661,8 +661,14 @@ RuntimeCreateResult Runtime::Create(RuntimeConfig config)
     Config::SetBase(Config::GFX_EFB_SCALE, *impl->config.graphics.internal_resolution_scale);
 
   const std::vector<std::string> audio_backends = AudioCommon::GetSoundBackends();
-  // Native runs stay muted, including visible presentation, without opening an audio endpoint.
-  if (impl->config.graphics.external_presentation || impl->config.headless)
+  // Exclusive-mode WASAPI takes the device from every other program (it
+  // stopped browsers and music): an explicit request gets shared-mode Cubeb.
+  if (impl->config.audio.backend == BACKEND_WASAPI)
+    impl->config.audio.backend = BACKEND_CUBEB;
+  // Native runs stay muted, including visible presentation, without opening an
+  // audio endpoint, unless a backend was asked for explicitly.
+  if (impl->config.headless ||
+      (impl->config.graphics.external_presentation && impl->config.audio.backend.empty()))
   {
     impl->config.audio.backend = BACKEND_NULLSOUND;
   }

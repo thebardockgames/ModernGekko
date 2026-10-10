@@ -291,7 +291,9 @@ int main(int argc, char** argv)
     // keeps the command processor and timing with its Null video backend.
     config.graphics.backend = "Null";
     config.graphics.native_gx = true;
-    config.audio.backend = "No Audio Output";
+    // Silent unless an audio backend was asked for explicitly.
+    if (config.audio.backend.empty())
+      config.audio.backend = "No Audio Output";
     std::cout << "graphics backend: NativeGX (native GX renderer)\n" << std::flush;
     if (!frame_interpolation)
       frame_interpolation = moderngekko::FrameInterpolationMode::Interpolate;
@@ -301,7 +303,9 @@ int main(int argc, char** argv)
     // Share Dolphin's mature GX compatibility renderer with the StaticRecomp
     // CPU. No capture bridge, second GX decoder, or companion renderer.
     config.graphics.backend = "D3D12";
-    config.audio.backend = "No Audio Output";
+    // Silent unless an audio backend was asked for explicitly.
+    if (config.audio.backend.empty())
+      config.audio.backend = "No Audio Output";
     std::cout << "graphics backend: NativeD3D12Integrated (shared GX D3D12 renderer)\n" << std::flush;
     // 60 distinct images per second for this 30 Hz game by default.
     if (!frame_interpolation)

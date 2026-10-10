@@ -84,8 +84,9 @@ if(MODERNGEKKO_ENABLE_DOLPHIN_RUNTIME)
     set(USE_UPNP OFF CACHE BOOL "" FORCE)
     set(ENCODE_FRAMEDUMPS OFF CACHE BOOL "" FORCE)
     set(ENABLE_LLVM OFF CACHE BOOL "" FORCE)
-    # Cubeb is Dolphin's only audio backend on macOS
-    if(APPLE)
+    # Cubeb is Dolphin's only audio backend on macOS, and the shared-mode one
+    # on Windows (Dolphin's WASAPI backend is exclusive mode).
+    if(APPLE OR WIN32)
         set(ENABLE_CUBEB ON CACHE BOOL "" FORCE)
     else()
         set(ENABLE_CUBEB OFF CACHE BOOL "" FORCE)
