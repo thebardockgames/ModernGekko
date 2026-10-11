@@ -748,6 +748,7 @@ RuntimeRunResult Runtime::Run()
 
   // Native SDK disc reads come straight from the extracted files.
   StaticRecompNativeSdk::SetGameRoot(m_impl->config.game_root.string());
+  StaticRecompNativeSdk::SetModsRoot(m_impl->config.mods_directory.string());
   auto boot = BootParameters::GenerateFromFile(m_impl->metadata.main_dol.string());
   if (!boot)
   {

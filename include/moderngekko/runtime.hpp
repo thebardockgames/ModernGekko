@@ -70,6 +70,8 @@ struct RuntimeConfig
 {
   std::filesystem::path game_root;
   std::filesystem::path user_directory;
+  // Folder of user mods (music/, characters/, stages/, menus/); empty: none.
+  std::filesystem::path mods_directory;
   ModuleSource module;
   GraphicsSettings graphics;
   AudioSettings audio;

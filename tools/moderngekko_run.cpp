@@ -36,7 +36,7 @@ void Usage()
 {
   std::cerr << "usage: " MODERNGEKKO_RUNNER_NAME
                " [--game <extracted-root>] [--module <path>]\n"
-               "       [--user-dir <path>] [--title <text>]\n"
+               "       [--user-dir <path>] [--title <text>] [--mods-dir <path>]\n"
                "       [--graphics <backend|NativeGX|NativeD3D12|NativeD3D12Integrated>] [--audio <backend>]\n"
                "       [--wayland] [-X11] [--headless] [--allow-interpreter]\n"
                "       [--run-seconds <positive seconds>]\n"
@@ -120,6 +120,8 @@ int main(int argc, char** argv)
     };
     if (arg == "--game")
       config.game_root = value("--game");
+    else if (arg == "--mods-dir")
+      config.mods_directory = value("--mods-dir");
     else if (arg == "--module")
       module_path = value("--module");
     else if (arg == "--user-dir")
