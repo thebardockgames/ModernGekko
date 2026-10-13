@@ -550,6 +550,23 @@ if(MODERNGEKKO_ENABLE_DOLPHIN_RUNTIME)
         target_compile_definitions(moderngekko-launcher PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
     endif()
 
+    # Read-only disc image access (ISO/RVZ/WBFS...) for standalone tools such
+    # as the BT3 viewer, loaded at run time through a plain C ABI.
+    add_library(moderngekko_disc SHARED
+        src/disc/disc_reader.cpp
+        src/disc/disc_host_stubs.cpp
+        include/moderngekko/disc_reader.h)
+    target_include_directories(moderngekko_disc PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/include"
+        "${CMAKE_CURRENT_SOURCE_DIR}/vendor/dolphin/Source/Core")
+    target_compile_definitions(moderngekko_disc PRIVATE MODERNGEKKO_DISC_BUILD)
+    target_compile_features(moderngekko_disc PRIVATE cxx_std_23)
+    target_link_libraries(moderngekko_disc PRIVATE discio uicommon)
+    if(MSVC)
+        target_compile_options(moderngekko_disc PRIVATE /Zc:preprocessor)
+        target_compile_definitions(moderngekko_disc PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
+    endif()
+
     add_executable(moderngekko-port tools/moderngekko_port.cpp)
     target_link_libraries(moderngekko-port PRIVATE ModernGekko::Runtime)
     target_compile_definitions(moderngekko-port PRIVATE
