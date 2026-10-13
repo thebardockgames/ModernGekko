@@ -2,6 +2,7 @@
 
 #include "moderngekko/game.hpp"
 #include "moderngekko/module_abi.h"
+#include "moderngekko/pc_settings.hpp"
 
 #include <filesystem>
 #include <cstdint>
@@ -39,6 +40,7 @@ struct GraphicsSettings
   // Client size of the game window (Dolphin's render window settings).
   std::optional<int> window_width;
   std::optional<int> window_height;
+  std::optional<bool> vsync;
 };
 
 struct AudioSettings
@@ -80,6 +82,13 @@ struct RuntimeConfig
   bool headless = false;
   bool allow_interpreter = false;
   bool show_fps_in_title = true;
+  bool start_minimized = false;
+  bool keep_minimized = false; // Background audit; normal play may restore manually.
+  bool enable_pc_settings = true;
+    bool pc_settings_prototype = false; // Temporary service test UI, not the game's menu extension.
+    std::filesystem::path native_menu_definition;
+    std::filesystem::path native_menu_assets;
+    std::filesystem::path original_menu_reference_trace;
   std::optional<std::string> window_title;
   std::filesystem::path load_state;
   std::filesystem::path save_state;
@@ -144,6 +153,12 @@ public:
   void RequestStop();
   std::optional<RuntimeError> Pause();
   std::optional<RuntimeError> Resume();
+  PcSettingsStatus GetPcSettingsStatus() const;
+  std::optional<RuntimeError> RequestPcSettings(PcSettings settings);
+  bool OpenPcSettings();
+  void ConfirmPcSettings();
+  void RevertPcSettings();
+  void CapturePcSettings(std::filesystem::path path);
 
   const RuntimeConfig& GetConfig() const;
   const GameMetadata& GetGameMetadata() const;

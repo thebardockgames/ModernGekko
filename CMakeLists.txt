@@ -91,6 +91,11 @@ if(MODERNGEKKO_ENABLE_DOLPHIN_RUNTIME)
     else()
         set(ENABLE_CUBEB OFF CACHE BOOL "" FORCE)
     endif()
+    if(MSVC)
+        # pkg-config may discover MinGW Speex on Windows. Build the bundled
+        # source with MSVC instead of mixing its headers and GCC libraries.
+        set(BUNDLE_SPEEX ON CACHE BOOL "" FORCE)
+    endif()
     set(ENABLE_HWDB OFF CACHE BOOL "" FORCE)
     set(ENABLE_EVDEV OFF CACHE BOOL "" FORCE)
     set(ENABLE_WAYLAND ON CACHE BOOL "" FORCE)
@@ -142,6 +147,20 @@ endif()
 
 add_library(moderngekko_abi INTERFACE)
 add_library(ModernGekko::ABI ALIAS moderngekko_abi)
+
+add_library(moderngekko_pc_settings STATIC src/runtime/pc_settings.cpp)
+target_link_libraries(moderngekko_pc_settings PUBLIC ModernGekko::ABI)
+target_include_directories(moderngekko_pc_settings PRIVATE vendor/picojson)
+target_compile_features(moderngekko_pc_settings PUBLIC cxx_std_20)
+if(MSVC)
+    target_compile_definitions(moderngekko_pc_settings PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+    target_compile_options(moderngekko_pc_settings PRIVATE /utf-8)
+endif()
+if(BUILD_TESTING)
+    add_executable(moderngekko_pc_settings_test tests/pc_settings_test.cpp)
+    target_link_libraries(moderngekko_pc_settings_test PRIVATE moderngekko_pc_settings)
+    add_test(NAME moderngekko.pc_settings COMMAND moderngekko_pc_settings_test)
+endif()
 
 target_include_directories(moderngekko_abi
     INTERFACE
@@ -284,10 +303,29 @@ target_compile_features(moderngekko_legacy PUBLIC cxx_std_23)
 target_include_directories(moderngekko_legacy PRIVATE
     "${CMAKE_CURRENT_SOURCE_DIR}/vendor/dolphin_legacy")
 
-target_link_libraries(moderngekko PUBLIC ModernGekko::ABI PRIVATE fmt::fmt)
+target_link_libraries(moderngekko PUBLIC ModernGekko::ABI moderngekko_pc_settings PRIVATE fmt::fmt)
+target_include_directories(moderngekko PRIVATE vendor/picojson)
+if(BUILD_TESTING AND MODERNGEKKO_ENABLE_DOLPHIN_RUNTIME)
+    add_executable(moderngekko_native_menu_test tests/native_menu.cpp)
+    target_link_libraries(moderngekko_native_menu_test PRIVATE moderngekko)
+    target_include_directories(moderngekko_native_menu_test PRIVATE vendor/picojson "${CMAKE_CURRENT_SOURCE_DIR}/../../viewer/src")
+    target_compile_features(moderngekko_native_menu_test PRIVATE cxx_std_20)
+    add_test(NAME moderngekko.native_menu_definition COMMAND moderngekko_native_menu_test "${CMAKE_CURRENT_SOURCE_DIR}/../../menus/options.json")
+    add_executable(moderngekko_native_game_options_test tests/native_game_options.cpp)
+    target_compile_features(moderngekko_native_game_options_test PRIVATE cxx_std_20)
+    add_test(NAME moderngekko.native_game_options COMMAND moderngekko_native_game_options_test)
+endif()
 if(MODERNGEKKO_ENABLE_DOLPHIN_RUNTIME)
+    target_include_directories(moderngekko PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/../../viewer/src")
     target_sources(moderngekko PRIVATE
         src/runtime/dolphin_runtime.cpp
+        src/runtime/pc_settings_runtime.cpp
+        src/runtime/original_pc_menu.cpp
+        src/runtime/native_options_menu.cpp
+        src/runtime/native_menu_scene.cpp
+        ../../viewer/src/menu_formats.cpp
+        ../../viewer/src/formats.cpp
+        src/runtime/original_menu_reference.cpp
         src/gpu/gx_command_processor.cpp
         src/gpu/gx_logging_backend.cpp
         src/gpu/gx_state_backend.cpp
@@ -327,7 +365,7 @@ if(MODERNGEKKO_ENABLE_DOLPHIN_RUNTIME)
     else()
         target_compile_definitions(moderngekko PRIVATE _M_GENERIC=1)
     endif()
-    target_link_libraries(moderngekko PRIVATE core uicommon)
+    target_link_libraries(moderngekko PRIVATE core uicommon imgui)
     if(WIN32)
         # Dolphin's windowed backend for Windows (Win32/GDI + DWM)
         target_sources(moderngekko PRIVATE
@@ -335,7 +373,7 @@ if(MODERNGEKKO_ENABLE_DOLPHIN_RUNTIME)
         target_include_directories(moderngekko PRIVATE
             "${CMAKE_CURRENT_SOURCE_DIR}/vendor/dolphin/Source/Core/DolphinNoGUI")
         # needed for adjusting window decorations with DwmSetWindowAttribute
-        target_link_libraries(moderngekko PRIVATE dwmapi.lib)
+        target_link_libraries(moderngekko PRIVATE dwmapi.lib xinput9_1_0.lib)
     endif()
     if(TARGET PkgConfig::X11)
         target_sources(moderngekko PRIVATE

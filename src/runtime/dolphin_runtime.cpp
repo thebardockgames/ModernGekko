@@ -1,4 +1,5 @@
 #include "moderngekko/runtime.hpp"
+#include "pc_settings_runtime.hpp"
 
 #include "AudioCommon/AudioCommon.h"
 #include "Common/Config/Config.h"
@@ -155,7 +156,7 @@ void MaybeConfigureMovie()
 std::vector<std::string> Host_GetPreferredLocales() { return {}; }
 void Host_PPCSymbolsChanged() {}
 void Host_PPCBreakpointsChanged() {}
-bool Host_UIBlocksControllerState() { return false; }
+bool Host_UIBlocksControllerState() { return moderngekko::PcSettingsBlocksInput(); }
 void Host_Message(HostMessageID id)
 {
   if (id == HostMessageID::WMUserStop && s_platform)
@@ -216,6 +217,7 @@ struct Runtime::Impl
   GameMetadata metadata;
   std::string title;
   std::unique_ptr<Platform> platform;
+  std::unique_ptr<RuntimePcSettings> pc_settings;
   Common::EventHook state_hook;
   Common::EventHook input_frame_hook;
   Common::EventHook reference_frame_hook;
@@ -359,6 +361,8 @@ RuntimeCreateResult Runtime::Create(RuntimeConfig config)
   else
     impl->platform = Platform::CreateWin32Platform();
 #endif
+  if(impl->platform)impl->platform->SetStartMinimized(impl->config.start_minimized);
+  if(impl->platform)impl->platform->SetKeepMinimized(impl->config.keep_minimized);
   if (!impl->platform || !impl->platform->Init())
   {
     UICommon::Shutdown();
@@ -433,6 +437,7 @@ RuntimeCreateResult Runtime::Create(RuntimeConfig config)
     controller->SetInputOverrideFunction(
         [frame, last_pulse, steps, gamecube](std::string_view group, std::string_view control, double) -> std::optional<double> {
           if (group != "Buttons" && group != "D-Pad" && group != "Main Stick" && group != "C-Stick") return std::nullopt;
+          if(PcSettingsBlocksInput())return 0.0;
           const auto current = frame->load(std::memory_order_relaxed);
           double value = 0;
           for (const auto& step : steps)
@@ -659,6 +664,17 @@ RuntimeCreateResult Runtime::Create(RuntimeConfig config)
     Config::SetBase(Config::MAIN_GFX_BACKEND, std::string("Null"));
   if (impl->config.graphics.internal_resolution_scale)
     Config::SetBase(Config::GFX_EFB_SCALE, *impl->config.graphics.internal_resolution_scale);
+  if(impl->config.graphics.vsync)Config::SetBase(Config::GFX_VSYNC,*impl->config.graphics.vsync);
+#ifdef _WIN32
+  if(impl->config.enable_pc_settings&&!impl->config.headless&&!impl->config.graphics.native_gx&&
+     impl->config.graphics.backend=="D3D12"&&impl->metadata.disc_id=="RDSE70"&&
+     impl->metadata.dol_sha256=="247dff47ae9c0deed3fdddf34d73ceec5e995980d5a14aaff4a3ab710b2ffdbc"){
+    PcSettings initial{impl->config.graphics.window_width.value_or(Config::Get(Config::MAIN_RENDER_WINDOW_WIDTH)),
+      impl->config.graphics.window_height.value_or(Config::Get(Config::MAIN_RENDER_WINDOW_HEIGHT)),
+      impl->config.graphics.internal_resolution_scale.value_or(1),Config::Get(Config::GFX_VSYNC)};
+    impl->pc_settings=std::make_unique<RuntimePcSettings>(impl->config.user_directory,*impl->platform,initial,impl->config.pc_settings_prototype,impl->config.native_menu_definition,impl->config.native_menu_assets,impl->config.original_menu_reference_trace);
+  }
+#endif
 
   const std::vector<std::string> audio_backends = AudioCommon::GetSoundBackends();
   // Exclusive-mode WASAPI takes the device from every other program (it
@@ -717,6 +733,7 @@ RuntimeCreateResult Runtime::Create(RuntimeConfig config)
 
 Runtime::~Runtime()
 {
+  if(m_impl->pc_settings)m_impl->pc_settings->Stop();
   RequestStop();
   if (m_impl->booted)
   {
@@ -775,6 +792,7 @@ RuntimeRunResult Runtime::Run()
             RuntimeError{RuntimeErrorCode::BootFailed, "Dolphin could not boot sys/main.dol"}};
   }
   m_impl->booted = true;
+  if(m_impl->pc_settings)m_impl->pc_settings->Start();
   std::jthread save_thread;
   if (!m_impl->config.save_state.empty())
   {
@@ -842,6 +860,7 @@ RuntimeRunResult Runtime::Run()
   movie_autosave_thread.request_stop();
   if (movie_autosave_thread.joinable())
     movie_autosave_thread.join();
+  if(m_impl->pc_settings)m_impl->pc_settings->Stop();
   m_impl->platform->SaveWindowGeometry();
   if (s_movie_recording_active)
   {
@@ -892,6 +911,18 @@ std::optional<RuntimeError> Runtime::Resume()
 }
 
 const RuntimeConfig& Runtime::GetConfig() const { return m_impl->config; }
+PcSettingsStatus Runtime::GetPcSettingsStatus()const{
+  if(m_impl->pc_settings)return m_impl->pc_settings->Status();
+  PcSettingsStatus s;s.message="Ajustes PC no disponibles para este backend o juego";return s;
+}
+std::optional<RuntimeError> Runtime::RequestPcSettings(PcSettings settings){
+  if(!m_impl->pc_settings||!m_impl->running)return RuntimeError{RuntimeErrorCode::InvalidState,"Los ajustes PC requieren el juego Wii verificado y backend integrado activo"};
+  if(auto error=m_impl->pc_settings->Request(settings))return RuntimeError{RuntimeErrorCode::InvalidState,*error};return {};
+}
+bool Runtime::OpenPcSettings(){return m_impl->pc_settings&&m_impl->running&&m_impl->pc_settings->Open();}
+void Runtime::ConfirmPcSettings(){if(m_impl->pc_settings)m_impl->pc_settings->Confirm();}
+void Runtime::RevertPcSettings(){if(m_impl->pc_settings)m_impl->pc_settings->Revert();}
+void Runtime::CapturePcSettings(std::filesystem::path path){if(m_impl->pc_settings)m_impl->pc_settings->Capture(std::move(path));}
 const GameMetadata& Runtime::GetGameMetadata() const { return m_impl->metadata; }
 const std::string& Runtime::GetWindowTitle() const { return m_impl->title; }
 }  // namespace moderngekko

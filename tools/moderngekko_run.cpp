@@ -4,6 +4,7 @@
 #include "native_presenter.hpp"
 
 #include <chrono>
+#include <atomic>
 #include <cmath>
 #include <csignal>
 #include <cstdlib>
@@ -39,6 +40,7 @@ void Usage()
                "       [--user-dir <path>] [--title <text>] [--mods-dir <path>]\n"
                "       [--graphics <backend|NativeGX|NativeD3D12|NativeD3D12Integrated>] [--audio <backend>]\n"
                "       [--wayland] [-X11] [--headless] [--allow-interpreter]\n"
+               "       [--minimized] [--vsync on|off] [--no-pc-settings] [--pc-settings-prototype] [--pc-settings-audit]\n"
                "       [--run-seconds <positive seconds>]\n"
                "       [--load-state <path>] [--save-state <path>]\n"
                "       [--save-state-frame <XFB>] [--frame-offset <XFB>]\n"
@@ -107,6 +109,10 @@ int main(int argc, char** argv)
   double run_seconds = 0;
   std::optional<moderngekko::FrameInterpolationMode> frame_interpolation;
   std::optional<int> internal_resolution;
+  std::optional<bool> vsync;
+  bool pc_settings_audit=false;
+  bool original_pc_menu_audit=false;
+  bool original_pc_menu_audit_large=false;
   for (int i = 1; i < argc; ++i)
   {
     const std::string arg = argv[i];
@@ -128,6 +134,29 @@ int main(int argc, char** argv)
       config.user_directory = value("--user-dir");
     else if (arg == "--title")
       config.window_title = value("--title");
+    else if(arg=="--minimized")
+      config.start_minimized=true;
+    else if(arg=="--keep-minimized")
+      {config.start_minimized=true;config.keep_minimized=true;}
+    else if(arg=="--no-pc-settings")
+      config.enable_pc_settings=false;
+    else if(arg=="--vsync"){
+      const std::string setting=value("--vsync");if(setting!="on"&&setting!="off"){std::cerr<<"--vsync expects on or off\n";return 2;}vsync=setting=="on";
+    }
+    else if(arg=="--pc-settings-audit")
+      {pc_settings_audit=true;config.pc_settings_prototype=true;}
+    else if(arg=="--pc-settings-prototype")
+      config.pc_settings_prototype=true;
+    else if(arg=="--native-menu-definition")
+      config.native_menu_definition=value("--native-menu-definition");
+    else if(arg=="--native-menu-assets")
+      config.native_menu_assets=value("--native-menu-assets");
+    else if(arg=="--original-menu-reference-trace")
+      config.original_menu_reference_trace=value("--original-menu-reference-trace");
+    else if(arg=="--original-pc-menu-audit")
+      original_pc_menu_audit=true;
+    else if(arg=="--original-pc-menu-audit-large")
+      {original_pc_menu_audit=true;original_pc_menu_audit_large=true;}
     else if (arg == "--graphics")
       config.graphics.backend = value("--graphics");
     else if (arg == "--internal-resolution")
@@ -228,6 +257,16 @@ int main(int argc, char** argv)
     return 2;
   }
   config.graphics.internal_resolution_scale = frontend_config.dolphin_scale;
+  if(config.enable_pc_settings){auto pc=moderngekko::LoadPcSettings(config.user_directory);
+    if(!pc.error.empty())std::cerr<<"[pc_settings] load warning: "<<pc.error<<'\n';
+    if(pc.settings){
+      config.graphics.internal_resolution_scale=pc.settings->render_scale;
+      if(!config.graphics.window_width){config.graphics.window_width=pc.settings->width;config.graphics.window_height=pc.settings->height;}
+      config.graphics.vsync=pc.settings->vsync;
+      std::cerr<<"[pc_settings] loaded saved preferences "<<pc.settings->width<<'x'<<pc.settings->height<<" scale="<<pc.settings->render_scale<<" vsync="<<pc.settings->vsync<<'\n';
+    }
+  }
+  if(vsync)config.graphics.vsync=*vsync;
   if (internal_resolution)
     config.graphics.internal_resolution_scale = *internal_resolution;
   config.show_fps_in_title = frontend_config.show_fps_in_title;
@@ -360,7 +399,79 @@ int main(int argc, char** argv)
       std::this_thread::sleep_for(std::chrono::milliseconds(50));
     }
   });
+  std::atomic<int> audit_result{(pc_settings_audit||original_pc_menu_audit) ? 1 : 0};
+  std::jthread settings_auditor;
+  if(pc_settings_audit||original_pc_menu_audit) settings_auditor=std::jthread([&](std::stop_token stop){
+    auto& runtime=*created.runtime;
+    const auto profile=runtime.GetConfig().user_directory;
+    auto wait=[&](auto predicate,int seconds){
+      auto end=std::chrono::steady_clock::now()+std::chrono::seconds(seconds);
+      while(!stop.stop_requested()&&std::chrono::steady_clock::now()<end){
+        if(predicate(runtime.GetPcSettingsStatus()))return true;
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+      }return false;
+    };
+    auto require=[](bool value,const char* message){if(!value)throw std::runtime_error(message);};
+    try{
+      using Phase=moderngekko::PcSettingsPhase;
+      if(original_pc_menu_audit){
+        require(wait([](auto s){return s.original_menu_available&&s.original_menu_selected;},120),"Original PC row not selected");
+        std::this_thread::sleep_for(std::chrono::milliseconds(300));
+        runtime.CapturePcSettings(profile/"original-pc-row.png");
+        require(wait([](auto s){return s.original_menu_page;},15),"Original PC page did not open");
+        std::this_thread::sleep_for(std::chrono::milliseconds(1500));
+        runtime.CapturePcSettings(profile/"original-pc-page.png");
+        require(wait([](auto s){return s.phase==Phase::Confirming;},35),"Original input did not apply settings");
+        auto applied=runtime.GetPcSettingsStatus();
+        require(applied.active==moderngekko::PcSettings{original_pc_menu_audit_large?1920:1280,original_pc_menu_audit_large?1080:720,2,false},"Original selectors produced wrong settings");
+        std::this_thread::sleep_for(std::chrono::milliseconds(800));
+        runtime.CapturePcSettings(profile/"original-pc-confirm.png");
+        require(wait([&](auto s){return s.phase==Phase::Idle&&moderngekko::LoadPcSettings(profile).settings==applied.active;},15),"Original confirm did not save");
+        require(wait([](auto s){return !s.original_menu_page;},15),"Back did not restore original options");
+        std::this_thread::sleep_for(std::chrono::milliseconds(1600));
+        runtime.CapturePcSettings(profile/"original-pc-return.png");
+        std::this_thread::sleep_for(std::chrono::milliseconds(500));
+        std::this_thread::sleep_for(std::chrono::milliseconds(9500));
+        runtime.CapturePcSettings(profile/"original-sound-after-pc.png");
+        std::this_thread::sleep_for(std::chrono::milliseconds(500));
+        std::ofstream report(profile/"original-pc-menu-audit.json");
+        report<<"{\"passed\":true,\"original_input\":true,\"original_fod\":true,\"saved\":true,\"returned\":true,\"backbuffer_width\":"<<applied.backbuffer_width<<",\"backbuffer_height\":"<<applied.backbuffer_height<<",\"efb_width\":"<<applied.efb_width<<",\"efb_height\":"<<applied.efb_height<<"}\n";
+      }else{
+      require(wait([](auto s){return s.eligible;},120),"Original Options not ready");
+      require(runtime.OpenPcSettings(),"Cannot open native page");
+      runtime.CapturePcSettings(profile/"pc-settings-open.png");
+      std::this_thread::sleep_for(std::chrono::milliseconds(500));
+      auto initial=runtime.GetPcSettingsStatus().active;
+      moderngekko::PcSettings next{1280,720,2,!initial.vsync};
+      require(!runtime.RequestPcSettings(next),"Apply rejected");
+      require(wait([&](auto s){return s.phase==Phase::Confirming&&s.active==next;},30),"Backend did not acknowledge settings");
+      auto applied=runtime.GetPcSettingsStatus();
+      require(applied.efb_width==1280&&applied.efb_height==1056,"Wrong actual EFB dimensions");
+      runtime.CapturePcSettings(profile/"pc-settings-confirm.png");
+      std::this_thread::sleep_for(std::chrono::milliseconds(500));
+      runtime.ConfirmPcSettings();
+      require(wait([](auto s){return s.phase==Phase::Idle;},5),"Confirmation failed");
+      require(moderngekko::LoadPcSettings(profile).settings==next,"Saved settings differ");
+      require(!runtime.RequestPcSettings(initial),"Second apply rejected");
+      require(wait([&](auto s){return s.phase==Phase::Confirming&&s.active==initial;},30),"Second backend acknowledgement failed");
+      runtime.RevertPcSettings();
+      require(wait([&](auto s){return s.phase==Phase::Idle&&s.active==next;},30),"Rollback failed");
+      require(moderngekko::LoadPcSettings(profile).settings==next,"Rollback changed saved settings");
+      auto invalid=next;invalid.render_scale=0;
+      require(bool(runtime.RequestPcSettings(invalid)),"Invalid setting accepted");
+      std::ofstream report(profile/"pc-settings-audit.json");
+      report<<"{\"passed\":true,\"original_options_ready\":true,\"backbuffer_width\":"<<applied.backbuffer_width
+            <<",\"backbuffer_height\":"<<applied.backbuffer_height<<",\"efb_width\":"<<applied.efb_width
+            <<",\"efb_height\":"<<applied.efb_height<<",\"vsync\":"<<(next.vsync?"true":"false")
+            <<",\"saved_and_reloaded\":true,\"rollback_verified\":true,\"invalid_rejected\":true}\n";
+      }
+      audit_result=0;
+    }catch(const std::exception& error){std::cerr<<"[pc_settings_audit] failed: "<<error.what()<<'\n';}
+    runtime.RequestStop();
+  });
   const moderngekko::RuntimeRunResult result = created.runtime->Run();
+  settings_auditor.request_stop();
+  if(settings_auditor.joinable())settings_auditor.join();
   signal_watcher.request_stop();
   signal_watcher.join();
   if (native_presenter && native_presenter->ExitCode().value_or(0) != 0)
@@ -373,5 +484,5 @@ int main(int argc, char** argv)
     std::cerr << "runtime failed: " << result.error->message << '\n';
     return 1;
   }
-  return 0;
+  return audit_result.load();
 }
