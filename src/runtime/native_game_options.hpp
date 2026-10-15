@@ -4,6 +4,7 @@
 #include <functional>
 #include <initializer_list>
 #include <string>
+#include "bt3_menu_definitions.hpp"
 namespace moderngekko {
 // RDSE70 settings adapter. Offsets and calls are verified against the Wii DOL,
 // not the PS2 controller: Wii screen positioning is limited to +/-8, and its
@@ -17,7 +18,7 @@ public:
  unsigned object=0,save=0;
  bool reset=false;int reset_choice=1;
  void Open(int category){
-  Set(0x10c,category-1);Set(0x108,category);Set(0x104,category==1?1:category==2?7:category==3?12:17);
+  Set(0x10c,category-1);Set(0x108,category);Set(0x104,category==1?1:bt3::originalState(bt3::gamePage(category-1).id(),bt3::gamePage(category-1).orderedItems().front()->id));
   if(category==1){Set(0x10c,0);Set(0x128,0);}
   Voice(category==1?1:category==2?7:category==3?11:23);
  }
@@ -41,13 +42,26 @@ public:
   }
   if(state>=1&&state<=21&&state!=5&&state!=6&&((pressed|repeat)&(up|down|left|right|a|b)))call(0x8011fd64,{1,unsigned((pressed&a)?1:(pressed&b)?2:0)});
   if(state==2||state==3||state==4){
-   const int first=state==2?7:state==3?12:17,last=state==2?10:state==3?16:19;
-   if(repeat&(up|down))Set(0x104,(int(Get(0x104))-first+((repeat&up)?last-first:1))%(last-first+1)+first);
+   const auto menu=bt3::gamePage(state-1);
+   if(repeat&(up|down)){
+    int row=0;while(row<menu.size()&&bt3::originalState(menu.id(),menu.orderedItems()[row]->id)!=int(Get(0x104)))++row;
+    if(row==menu.size())throw std::runtime_error("Unknown BT3 selected control");
+    const int next=menu.moveSelection(row,(repeat&up)?-1:1);
+    Set(0x104,bt3::originalState(menu.id(),menu.orderedItems()[next]->id));
+   }
    else if(pressed&b){Set(0x108,0);Set(0x10c,0);Set(0x104,state);Voice(state);}
    else if(pressed&a){
-    const int cursor=int(Get(0x104));Set(0x108,cursor);
+    const int cursor=int(Get(0x104));if(cursor>=256)return false;Set(0x108,cursor);
     if(cursor==7){Set(0x14c,read(save+0x1694));Set(0x178,Get(0x14c));}
     if(cursor==8||cursor==12||cursor==15){Set(0x128,cursor==8?read(save+0x1698):cursor==12?read(save+0x16a4):unsigned(!(read(save+0x1608)&1)));Set(0x178,Get(0x128));}
+    if(cursor==12){
+     auto& speaker=soundMenu.item("speaker");
+     speaker.bind([this]{return int(read(save+0x16a4));},[this](int value){
+      if(read(save+0x16a4)!=unsigned(value)){write(save+0x16a4,unsigned(value));Set(0x198,1);}
+      call(0x8002c19c,{});
+     });
+     speaker.beginEdit();
+    }
     if(cursor==9){Set(0x144,read(save+0x169c));Set(0x148,read(save+0x16a0));}
     if(cursor==13){Set(0x110,read(save+0x16a8));Set(0x114,read(save+0x16ac));Set(0x128,0);}
     if(cursor==14)call(0x80028014,{});
@@ -57,7 +71,14 @@ public:
    if(repeat&(up|down))Voice(int(Get(0x104)));
    return true;
   }
-  if(state==1||state==8||state==12||state==15){
+  if(state==12){
+   auto& speaker=soundMenu.item("speaker");
+   if(pressed&(left|right)){speaker.adjust((pressed&left)?-1:1);Set(0x128,unsigned(speaker.value()));}
+   else if(pressed&a){speaker.confirm();finish(3);}
+   else if(pressed&b){speaker.cancel();finish(3);}
+   return true;
+  }
+  if(state==1||state==8||state==15){
    if(pressed&(left|right))Set(0x128,Get(0x128)^1);
    else if(pressed&a){
     if(state==1){call(0x80191da8,{Get(0x128)});Set(0x188,1);}
@@ -112,8 +133,9 @@ public:
   return false; // original boot/exit and the external storage transaction
  }
 private:
+ ui::Menu soundMenu=bt3::soundMenu();
  unsigned Get(unsigned offset)const{return read(object+offset);}
  void Set(unsigned offset,unsigned value){write(object+offset,value);}
- void Voice(int cursor){const int line=cursor==12?11:cursor==14?17:cursor==15?18:cursor==16||cursor==19?10:cursor==17?23:cursor==18?25:cursor;Set(0x12c,line);call(0x8002c0b8,{Get(0x1ac),0x88ca,unsigned(line)});}
+ void Voice(int cursor){if(cursor>=256)return;const int line=cursor==12?11:cursor==14?17:cursor==15?18:cursor==16||cursor==19?10:cursor==17?23:cursor==18?25:cursor;Set(0x12c,line);call(0x8002c0b8,{Get(0x1ac),0x88ca,unsigned(line)});}
 };
 }

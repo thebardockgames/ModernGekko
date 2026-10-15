@@ -12,12 +12,23 @@ int main(){try{
  auto require=[](bool value,const char* message){if(!value)throw std::runtime_error(message);};
  auto input=[&](unsigned pressed,unsigned repeat=0){require(menu.Input(pressed,repeat),"Native state fell through");};
  const unsigned a=256,b=512,left=1,right=2,up=8,down=4;
+ menu.Open(3);input(a);input(right);
+ require(memory[0x56a4]==0&&memory[0x1128]==1,"Speaker draft must not change saved audio mode");
+ input(b);require(memory[0x56a4]==0&&menu.State()==3,"Speaker cancellation");
+ input(a);input(right);input(a);require(memory[0x56a4]==1&&menu.State()==3,"Speaker binding confirmation");
+ require(calls.back().first==0x8002c0b8,"Speaker confirmation restores voice guide");
+
  menu.Open(2);require(menu.State()==2&&memory[0x110c]==1,"Screen ABI");input(a);input(right);input(a);
  require(memory[0x5694]==1&&memory[0x1198]==1,"Camera commit");
  memory[0x1104]=9;input(a);for(int n=0;n<30;++n)input(0,right);
  require(memory[0x569c]==8,"Wii positive screen bound");
  for(int n=0;n<40;++n)input(0,left);require(int(memory[0x569c])==-8,"Wii negative screen bound");input(b);
  require(memory[0x569c]==0,"Screen cancellation");
+ menu.Open(2);memory[0x1104]=9;input(a);input(0,right);input(0,down);input(0x1000);
+ require(menu.State()==11&&menu.reset&&menu.reset_choice==1,"Position reset must initially select No");
+ input(b);require(menu.State()==9&&memory[0x569c]==1&&memory[0x56a0]==1,"Cancel reset preserves position");
+ input(0x1000);input(left);input(a);
+ require(menu.State()==9&&memory[0x569c]==0&&memory[0x56a0]==0,"Confirm reset centers both axes");input(b);
  menu.Open(3);memory[0x56a8]=9;memory[0x56ac]=9;memory[0x1104]=13;input(a);input(0,right);input(a);input(down);input(0,left);input(b);
  require(memory[0x56a8]==0&&memory[0x56ac]==9,"Volume confirmations and rollback");
  memory[0x1104]=16;input(a);require(menu.reset,"Reset prompt");input(left);input(a);
@@ -25,6 +36,11 @@ int main(){try{
  menu.Open(4);input(a);input(down);input(right);input(up);input(b);
  require(menu.State()==4&&(memory[0x5608]&8),"Native control type");
  memory[0x1104]=18;input(a);input(down);input(right);input(up);input(b);require(memory[0x5608]&2,"Native rumble");
+ menu.Open(4);memory[0x5608]&=~24u;input(a);input(right);input(down);
+ require(memory[0x1138]==1&&memory[0x1128]==0,"2P loads its own control type");
+ input(right);input(up);input(left);input(down);
+ require(memory[0x1138]==0&&memory[0x1128]==0&&(memory[0x5608]&16)&&!(memory[0x5608]&8),"1P keeps Normal while 2P stores Simple");
+ input(up);input(b);
  menu.Open(1);input(right);input(a);require(memory[0x1188]==1,"Storage busy ABI");
  require(calls.back().first==0x80191da8&&calls.back().second==std::vector<unsigned>{1},"Load storage service");
  std::cout<<"Wii bounds, commit/cancel, volume rollback, reset defaults, controls and storage dispatch passed\n";return 0;

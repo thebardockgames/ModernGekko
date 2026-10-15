@@ -31,7 +31,7 @@ private:
  NativeGameOptions game_options;
  std::ofstream native_audit;
  unsigned native_audit_tick=0,native_audit_transition=0;
- int audit_category=-1,audit_state=-99;
+ int audit_category=-1,audit_state=-99,audit_choice=-99;
  unsigned queued_service=0,queued_argument=0,service_return=0,service_lr=0,service_result=0;
  bool service_inflight=false;
  unsigned storage_updates=0;
@@ -51,6 +51,7 @@ private:
  void Compose(CPUState&);
  void Guide(CPUState&);
  bool Input(CPUState&);
+ bool OpenNativeAction(CPUState&,int command);
  void Enter(CPUState&);
  void Leave(CPUState&);
 };

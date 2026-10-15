@@ -140,9 +140,18 @@ void OriginalPcMenu::Guide(CPUState&){
  for(size_t n=0;n<=text.size();++n){Memory().Write_U8(n==text.size()?0:static_cast<unsigned char>(text[n]),table+18+unsigned(n)*2);Memory().Write_U8(0,table+19+unsigned(n)*2);}
  Write(guide_field,table);Write(option+0x12c,0);
 }
+bool OriginalPcMenu::OpenNativeAction(CPUState& cpu,int command){
+ if(command==-1){Enter(cpu);return true;}
+ if(command<1||command>5)throw std::invalid_argument("Unsupported backend page command");
+ Write(option+0x104,unsigned(command));
+ if(command==5){Write(option+0x10,Read(option+0x10)|2u);return false;}
+ game_options.object=option;game_options.save=Read(0x80630460);game_options.read=Read;game_options.write=Write;
+ game_options.call=[&](unsigned address,std::initializer_list<unsigned> args){return GameCall(cpu,address,args);};
+ game_options.Open(command);return true;
+}
 bool OriginalPcMenu::Input(CPUState& cpu){
  if(!available)return false;
- const auto* owned=service.NativeMenu();
+ auto* owned=service.NativeMenu();
  if(!owned&&(!(Read(option+0x10)&2)||(Read(Read(0x80630370)+0x14)&0x10)))return false;
  const auto guest_state=Read(option+0x108);
  // Let the original backend perform its one-time setup (voice/message handles)
@@ -152,12 +161,32 @@ bool OriginalPcMenu::Input(CPUState& cpu){
   Write(Pad+0x9a4,Read(Pad+0x9a4)&~(Up|Down|Left|Right|Accept|Back));Write(Pad+0x9a8,Read(Pad+0x9a8)&~(Up|Down|Left|Right|Accept|Back));cpu.gpr[3]=1;cpu.pc=cpu.lr&~3u;return true;
  }
  const unsigned repeat=Read(Pad+0x9a8),pressed=Read(Pad+0x9a4);
+ if(owned&&(page||guest_state==0||guest_state==2||guest_state==3||guest_state==4)){
+  const int category=page?0:int(Read(option+0x10c));
+  const std::string menu=page?"graphics":category==1?"screen":category==2?"sound":category==3?"controller":"options";
+  const int selectedRow=page?row:category?owned->RowForState(category,int(Read(option+0x104))):native_row;
+  const auto phase=service.Status().phase;
+  if(!page||phase==PcSettingsPhase::Idle||phase==PcSettingsPhase::Failed){
+   const auto result=owned->HandleInput(menu,selectedRow,pressed,repeat);
+   if(result.handled){
+    Call(cpu,0x8011fd64,{1,unsigned((pressed&Accept)?1:(pressed&Back)?2:0)});
+    if(result.backend&&!OpenNativeAction(cpu,result.backend))return false;
+    if(result.back){if(page)Leave(cpu);else if(!category){if(!OpenNativeAction(cpu,5))return false;}else{
+     game_options.object=option;game_options.save=Read(0x80630460);game_options.read=Read;game_options.write=Write;game_options.call=[&](unsigned address,std::initializer_list<unsigned> args){return GameCall(cpu,address,args);};game_options.Input(Back,0);
+    }}
+    // Generic page changes and popups animate themselves. A callback-only
+    // button must not run the original disappearing acceptance clip.
+    native_accept_pending=result.backend&&(pressed&Accept)!=0;
+    Write(Pad+0x9a4,pressed&~(Up|Down|Left|Right|Accept|Back));Write(Pad+0x9a8,repeat&~(Up|Down|Left|Right|Accept|Back));ReturnOrService(cpu,1);return true;
+   }
+  }
+ }
  if(owned&&!page&&guest_state!=0&&guest_state!=0xffffffffu){
   game_options.object=option;game_options.save=Read(0x80630460);
   game_options.read=Read;game_options.write=Write;
   game_options.call=[&](unsigned address,std::initializer_list<unsigned> args){return GameCall(cpu,address,args);};
   if(game_options.Input(pressed,repeat)){
-   if(Read(option+0x108)==0){for(int n=0;n<owned->Count();++n)if(owned->OriginalCursor(n)==int(Read(option+0x104)))native_row=n;}
+   if(Read(option+0x108)==0&&owned->OriginalCursor(native_row)!=int(Read(option+0x104))){for(int n=0;n<owned->Count();++n)if(owned->OriginalCursor(n)==int(Read(option+0x104))){native_row=n;break;}}
    native_accept_pending=(pressed&Accept)!=0;
    Write(Pad+0x9a4,pressed&~(Up|Down|Left|Right|Accept|Back));Write(Pad+0x9a8,repeat&~(Up|Down|Left|Right|Accept|Back));ReturnOrService(cpu,1);return true;
   }
@@ -168,20 +197,13 @@ bool OriginalPcMenu::Input(CPUState& cpu){
    if(!native->Ready())return false;
    if(!native_initialized){native_row=0;native_initialized=true;}
    if(repeat&(Up|Down)){
-    native_row=(native_row+((repeat&Up)?native->Count()-1:1))%native->Count();Call(cpu,0x8011fd64,{1,0});
+    native_row=native->MoveSelection(native_row,(repeat&Up)?-1:1);Call(cpu,0x8011fd64,{1,0});
     const int cursor=native->OriginalCursor(native_row);if(cursor>0){Write(option+0x12c,cursor);Call(cpu,0x8002c0b8,{Read(option+0x1ac),0x88ca,unsigned(cursor)});}
    }
    selected=native->IsGraphics(native_row);
    if(pressed&Accept){
     native_accept_pending=true;
-    if(selected)Enter(cpu);
-    else{const int cursor=native->OriginalCursor(native_row);
-     Write(option+0x104,unsigned(cursor));
-     if(cursor==5){Write(option+0x10,Read(option+0x10)|2u);return false;}
-     game_options.object=option;game_options.save=Read(0x80630460);game_options.read=Read;game_options.write=Write;
-     game_options.call=[&](unsigned address,std::initializer_list<unsigned> args){return GameCall(cpu,address,args);};
-     game_options.Open(cursor);
-    }
+    if(!OpenNativeAction(cpu,native->OriginalCursor(native_row)))return false;
    }else if(pressed&Back){Write(option+0x104,5);Write(option+0x10,Read(option+0x10)|2u);return false;}
    Write(Pad+0x9a4,Read(Pad+0x9a4)&~(Up|Down|Left|Right|Accept|Back));
    Write(Pad+0x9a8,Read(Pad+0x9a8)&~(Up|Down|Left|Right|Accept|Back));
@@ -214,17 +236,18 @@ bool OriginalPcMenu::Input(CPUState& cpu){
  }else{
   if(repeat&(Up|Down)){
    Plate(cpu,row==4?"mc_bottom_plate_1":"mc_menu_plate_"+std::to_string(row+1),"fl_off_start");
-   row=(row+((repeat&Up)?4:1))%5;
+   row=service.NativeMenu()?service.NativeMenu()->MoveGraphicsSelection(row,(repeat&Up)?-1:1):(row+((repeat&Up)?4:1))%5;
    Plate(cpu,row==4?"mc_bottom_plate_1":"mc_menu_plate_"+std::to_string(row+1),"fl_on_start");
-  }else if((pressed&(Left|Right))&&row<3){
+  }else if((pressed&(Left|Right))&&(service.NativeMenu()?service.NativeMenu()->GraphicsAction(row)<=1003:row<3)){
    const int direction=(pressed&Left)?-1:1;
-   if(row==0){constexpr std::array<std::array<int,2>,6> sizes{{{640,480},{960,720},{1280,720},{1440,1080},{1920,1080},{2560,1440}}};int index=0;
+   const int action=service.NativeMenu()?service.NativeMenu()->GraphicsAction(row):1001+row;
+   if(action==1001){constexpr std::array<std::array<int,2>,6> sizes{{{640,480},{960,720},{1280,720},{1440,1080},{1920,1080},{2560,1440}}};int index=0;
     for(int n=0;n<6;++n)if(draft.width==sizes[n][0]&&draft.height==sizes[n][1])index=n;
     index=(index+direction+6)%6;draft.width=sizes[index][0];draft.height=sizes[index][1];}
-   else if(row==1)draft.render_scale=(draft.render_scale-1+direction+4)%4+1;
+   else if(action==1002)draft.render_scale=(draft.render_scale-1+direction+4)%4+1;
    else draft.vsync=!draft.vsync;
    std::fprintf(stderr,"[pc_menu] selector row=%d width=%d height=%d scale=%d vsync=%d\n",row,draft.width,draft.height,draft.render_scale,int(draft.vsync));
-  }else if(pressed&Accept){native_accept_pending=service.NativeMenu()!=nullptr;if(row==3){if(auto error=service.Request(draft))std::fprintf(stderr,"[pc_menu] apply rejected: %s\n",error->c_str());}else if(row==4)Leave(cpu);}
+  }else if(pressed&Accept){native_accept_pending=service.NativeMenu()!=nullptr;if((service.NativeMenu()?service.NativeMenu()->GraphicsAction(row):1001+row)==1004){if(auto error=service.Request(draft))std::fprintf(stderr,"[pc_menu] apply rejected: %s\n",error->c_str());}else if((service.NativeMenu()?service.NativeMenu()->GraphicsAction(row):1001+row)==1005)Leave(cpu);}
   else if(pressed&Back)Leave(cpu);
  }
  Write(Pad+0x9a4,Read(Pad+0x9a4)&~(Up|Down|Left|Right|Accept|Back));
@@ -266,7 +289,7 @@ void OriginalPcMenu::Compose(CPUState& cpu){
    const unsigned save=Read(0x80630460);
    for(int n=0;n<7;++n)frame.game_values[n]=Read(save+0x1694+unsigned(n)*4);
    frame.game_values[7]=Read(save+0x1608);
-   if(frame.category)frame.row=int(Read(option+0x104))-(frame.category==1?7:frame.category==2?12:17);
+   if(frame.category)frame.row=native->RowForState(frame.category,int(Read(option+0x104)));
    if(frame.game_state==7)frame.choice=int(Read(option+0x14c));
    if(frame.game_state==14){const int count=int(Read(option+0x1a0));frame.choice=int(Read(option+0x118));
     if(count>0&&count<256)for(int n=0;n<count;++n)frame.tracks.push_back(native->TrackName(Read(Read(option+0x19c)+unsigned(n)*4)));
@@ -284,15 +307,30 @@ void OriginalPcMenu::Compose(CPUState& cpu){
    frame.accepted=native_accept_pending;native_accept_pending=false;
    // Query the audio service, not the original guide's sprite pool/controller.
    if(frame.active){const auto voice=Call(cpu,0x8011f034,{});frame.speaking=Call(cpu,0x8011f1ec,{voice})!=0;}
+   native->Publish(frame);
    if(const char* path=std::getenv("MODERNGEKKO_NATIVE_OPTIONS_AUDIT")){
     const std::filesystem::path folder(path);
     if(!native_audit.is_open()){std::filesystem::create_directories(folder);native_audit.open(folder/"states.jsonl");}
     if(frame.active){
-     if(frame.category!=audit_category||frame.game_state!=audit_state){native_audit_transition=0;audit_category=frame.category;audit_state=frame.game_state;}
+     const auto presentation=native->Presentation();
+     static std::string lastMenu;static int lastRow=-1;static bool lastPopup=false;
+     const int logicalRow=presentation.menu.rows.empty()?0:presentation.menu.rows[presentation.menu.selected].sourceRow;
+     const bool viewChanged=presentation.menu.id!=lastMenu||logicalRow!=lastRow||presentation.popup.active!=lastPopup;
+     lastMenu=presentation.menu.id;lastRow=logicalRow;lastPopup=presentation.popup.active;
+     const bool choiceScreen=frame.game_state==7||frame.game_state==8||frame.game_state==14||frame.game_state==17||frame.game_state==18||frame.game_state==20||frame.game_state==21;
+     if(viewChanged||frame.category!=audit_category||frame.game_state!=audit_state||(choiceScreen&&frame.choice!=audit_choice)){native_audit_transition=0;audit_category=frame.category;audit_state=frame.game_state;audit_choice=frame.choice;}
      else ++native_audit_transition;
      picojson::array values;for(auto value:frame.game_values)values.emplace_back(double(value));
      picojson::object record{{"tick",picojson::value(double(native_audit_tick))},{"state",picojson::value(double(frame.game_state))},{"category",picojson::value(double(frame.category))},{"row",picojson::value(double(frame.row))},{"choice",picojson::value(double(frame.choice))},{"ready",picojson::value(native->Ready())},{"reset",picojson::value(frame.reset)},{"busy",picojson::value(frame.busy)},{"values",picojson::value(values)}};
+     record["menu"]=picojson::value(presentation.menu.id);record["logical_row"]=picojson::value(double(logicalRow));record["total_rows"]=picojson::value(double(presentation.menu.total));
+     record["popup"]=picojson::value(presentation.popup.active);record["popup_value"]=picojson::value(double(presentation.popup.value));
+     record["entry_black"]=picojson::value(double(presentation.entry_black));record["exit_black"]=picojson::value(double(presentation.fade));record["widget_kind"]=picojson::value(double(presentation.widget_kind));record["widget_player"]=picojson::value(double(presentation.widget_player));
+     const bool type=presentation.widget_kind==17||presentation.widget_kind==21;
+     record["player_setting"]=picojson::value(double(bool(presentation.widget_values[7]&((type?8u:2u)<<presentation.widget_player))));
+     record["list_count"]=picojson::value(double(presentation.list_scroll.total));record["list_first"]=picojson::value(double(presentation.list_scroll.first));record["thumb_height"]=picojson::value(double(presentation.list_scroll.thumbHeight));record["thumb_offset"]=picojson::value(double(presentation.list_scroll.thumbOffset));
+     picojson::array visible;for(const auto& row:presentation.menu.rows)visible.emplace_back(row.text);record["visible_rows"]=picojson::value(visible);
      const auto flow=Read(0x80630828);if(flow>=0x80000000u&&flow<0x94000000u){record["storage_kind"]=picojson::value(double(Read(flow+36)));record["storage_state"]=picojson::value(double(Read(flow+40)));}
+     picojson::array opacity;for(float alpha:native->CameraOpacity())opacity.emplace_back(double(alpha));record["camera_opacity"]=picojson::value(opacity);
      if(frame.busy){record["dialog_title"]=picojson::value(frame.dialog_title);record["dialog_text"]=picojson::value(frame.dialog_text);record["dialog_choice"]=picojson::value(double(frame.dialog_choice));}
      native_audit<<picojson::value(record).serialize()<<'\n';native_audit.flush();
      if(native_audit_transition==0||native_audit_transition==8||native_audit_transition==20||native_audit_transition==39||native_audit_transition==60||(frame.busy&&native_audit_tick%100==0))
@@ -300,7 +338,6 @@ void OriginalPcMenu::Compose(CPUState& cpu){
      ++native_audit_tick;
     }
    }
-   native->Publish(std::move(frame));
   return;
  }
  if(!checked){

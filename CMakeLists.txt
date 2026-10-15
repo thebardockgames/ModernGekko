@@ -23,6 +23,19 @@ endif()
 include(CTest)
 include(CheckIncludeFileCXX)
 
+# Portable screen definitions and value controls; no Dolphin/renderer dependency.
+add_library(moderngekko_menu INTERFACE)
+add_library(ModernGekko::Menu ALIAS moderngekko_menu)
+target_include_directories(moderngekko_menu INTERFACE "${CMAKE_CURRENT_SOURCE_DIR}/include")
+target_compile_features(moderngekko_menu INTERFACE cxx_std_20)
+target_compile_options(moderngekko_menu INTERFACE "$<$<CXX_COMPILER_ID:MSVC>:/utf-8>")
+if(BUILD_TESTING)
+    add_executable(moderngekko_menu_library_test tests/menu_library.cpp)
+    target_link_libraries(moderngekko_menu_library_test PRIVATE ModernGekko::Menu)
+    add_test(NAME moderngekko.menu_library COMMAND moderngekko_menu_library_test)
+endif()
+
+
 
 if(WIN32)
     set(MODERNGEKKO_DYNAMIC_MODULES_DEFAULT ON)
@@ -303,7 +316,7 @@ target_compile_features(moderngekko_legacy PUBLIC cxx_std_23)
 target_include_directories(moderngekko_legacy PRIVATE
     "${CMAKE_CURRENT_SOURCE_DIR}/vendor/dolphin_legacy")
 
-target_link_libraries(moderngekko PUBLIC ModernGekko::ABI moderngekko_pc_settings PRIVATE fmt::fmt)
+target_link_libraries(moderngekko PUBLIC ModernGekko::Menu ModernGekko::ABI moderngekko_pc_settings PRIVATE fmt::fmt)
 target_include_directories(moderngekko PRIVATE vendor/picojson)
 if(BUILD_TESTING AND MODERNGEKKO_ENABLE_DOLPHIN_RUNTIME)
     add_executable(moderngekko_native_menu_test tests/native_menu.cpp)
@@ -312,6 +325,7 @@ if(BUILD_TESTING AND MODERNGEKKO_ENABLE_DOLPHIN_RUNTIME)
     target_compile_features(moderngekko_native_menu_test PRIVATE cxx_std_20)
     add_test(NAME moderngekko.native_menu_definition COMMAND moderngekko_native_menu_test "${CMAKE_CURRENT_SOURCE_DIR}/../../menus/options.json")
     add_executable(moderngekko_native_game_options_test tests/native_game_options.cpp)
+    target_link_libraries(moderngekko_native_game_options_test PRIVATE ModernGekko::Menu)
     target_compile_features(moderngekko_native_game_options_test PRIVATE cxx_std_20)
     add_test(NAME moderngekko.native_game_options COMMAND moderngekko_native_game_options_test)
 endif()

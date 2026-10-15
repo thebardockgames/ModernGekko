@@ -113,6 +113,7 @@ int main(int argc, char** argv)
   bool pc_settings_audit=false;
   bool original_pc_menu_audit=false;
   bool original_pc_menu_audit_large=false;
+  bool audit_keep_running=false;
   for (int i = 1; i < argc; ++i)
   {
     const std::string arg = argv[i];
@@ -157,6 +158,8 @@ int main(int argc, char** argv)
       original_pc_menu_audit=true;
     else if(arg=="--original-pc-menu-audit-large")
       {original_pc_menu_audit=true;original_pc_menu_audit_large=true;}
+    else if(arg=="--audit-keep-running")
+      audit_keep_running=true;
     else if (arg == "--graphics")
       config.graphics.backend = value("--graphics");
     else if (arg == "--internal-resolution")
@@ -467,7 +470,7 @@ int main(int argc, char** argv)
       }
       audit_result=0;
     }catch(const std::exception& error){std::cerr<<"[pc_settings_audit] failed: "<<error.what()<<'\n';}
-    runtime.RequestStop();
+    if(!audit_keep_running || audit_result.load()!=0)runtime.RequestStop();
   });
   const moderngekko::RuntimeRunResult result = created.runtime->Run();
   settings_auditor.request_stop();
